@@ -411,7 +411,7 @@ export function LobbyView({
         <div className="text-[0.68rem] uppercase tracking-[0.22em] text-slate-500">
           {isP2P ? t("lobbyView.joinByCode") : t("lobbyView.joinATable")}
         </div>
-        <div className="flex w-full items-center gap-2">
+        <div className="flex w-full flex-col gap-2 sm:flex-row sm:items-center">
         <input
           type="text"
           value={joinCode}
@@ -419,8 +419,9 @@ export function LobbyView({
           onKeyDown={(e) => e.key === "Enter" && handleJoinByCode()}
           placeholder={isP2P ? t("lobbyView.p2pCodePlaceholder") : t("lobbyView.serverCodePlaceholder")}
           maxLength={isP2P ? 5 : 50}
-          className="flex-1 rounded-[18px] bg-black/18 px-4 py-2 font-mono text-sm tracking-wider text-white placeholder-gray-500 outline-none ring-1 ring-white/10 focus:ring-white/20"
+          className="min-w-0 flex-1 rounded-[18px] bg-black/18 px-4 py-2 font-mono text-sm tracking-wider text-white placeholder-gray-500 outline-none ring-1 ring-white/10 focus:ring-white/20"
         />
+        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto">
         <button
           onClick={handleJoinByCode}
           disabled={!joinCode.trim()}
@@ -428,6 +429,7 @@ export function LobbyView({
             tone: "cyan",
             size: "sm",
             disabled: !joinCode.trim(),
+            className: "flex-1 sm:flex-none",
           })}
         >
           {t("lobbyView.join")}
@@ -441,11 +443,13 @@ export function LobbyView({
               tone: "neutral",
               size: "sm",
               disabled: !joinCode.trim(),
+              className: "flex-1 sm:flex-none",
             })}
           >
             {t("lobbyView.watch")}
           </button>
         )}
+        </div>
         </div>
       </div>
 
