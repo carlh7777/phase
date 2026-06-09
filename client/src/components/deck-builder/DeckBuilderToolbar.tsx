@@ -122,7 +122,8 @@ export function DeckBuilderToolbar({
           <SelectField
             onChange={(e) => e.target.value && onLoad(e.target.value)}
             value=""
-            className="max-w-[8rem] shrink-0 rounded-xl border border-white/10 bg-black/18 px-3 py-1.5 text-sm text-white focus:outline-none sm:max-w-none"
+            wrapperClassName="max-w-[8rem] shrink-0 sm:max-w-none"
+            className="rounded-xl border border-white/10 bg-black/18 px-3 py-1.5 text-sm text-white focus:outline-none"
           >
             <option value="">{t("toolbar.loadDeck")}</option>
             {savedDecks.map((name) => (
