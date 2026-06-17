@@ -43,11 +43,12 @@ export function loadPreconDeckMap(): Promise<DeckMap | null> {
   return fetchPromise;
 }
 
+export type UseDecksStatus = "loading" | "success" | "error";
+
 export interface UseDecksResult {
   /** Catalog entries keyed by MTGJSON filename stem; `null` until the first fetch settles. */
   decks: DeckMap | null;
-  loading: boolean;
-  loadError: boolean;
+  status: UseDecksStatus;
 }
 
 /**
@@ -59,20 +60,19 @@ export interface UseDecksResult {
  */
 export function useDecks(): UseDecksResult {
   const [decks, setDecks] = useState<DeckMap | null>(cached);
-  const [loading, setLoading] = useState(!cached);
-  const [loadError, setLoadError] = useState(false);
+  const [status, setStatus] = useState<UseDecksStatus>(cached ? "success" : "loading");
 
   useEffect(() => {
     if (cached) return;
     loadPreconDeckMap().then((d) => {
-      setLoading(false);
       if (d) {
         setDecks(d);
+        setStatus("success");
         return;
       }
-      setLoadError(true);
+      setStatus("error");
     });
   }, []);
 
-  return { decks, loading, loadError };
+  return { decks, status };
 }

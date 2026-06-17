@@ -41,7 +41,7 @@ function coverageTone(pct: number): string {
 
 export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalProps) {
   const { t } = useTranslation("menu");
-  const { decks, loading, loadError } = useDecks();
+  const { decks, status } = useDecks();
   const [query, setQuery] = useState("");
   const [typeFilter, setTypeFilter] = useState<string>(ALL_TYPES);
   // Multi-select state. Keyed by deck id (filename stem) so it survives the
@@ -240,16 +240,16 @@ export function PreconDeckModal({ open, onClose, onImported }: PreconDeckModalPr
             menuLayout="dropdown"
             wrapperClassName="sm:w-52 shrink-0"
             fitContainer
-            disabled={loading || loadError}
+            disabled={status === "loading" || status === "error"}
             className="rounded-lg border-white/10 bg-black/30 py-2 focus-visible:ring-white/30"
           />
         </div>
 
 
         <div className="flex-1 overflow-y-auto rounded-lg border border-white/5 bg-black/20">
-          {loading ? (
+          {status === "loading" ? (
             <div className="p-8 text-center text-sm text-slate-500">{t("precon.loadingCatalog")}</div>
-          ) : loadError ? (
+          ) : status === "error" ? (
             <div className="p-8 text-center text-sm text-rose-300/90">{t("precon.loadFailed")}</div>
           ) : filtered.length === 0 ? (
             <div className="p-8 text-center text-sm text-slate-500">{t("precon.noMatch")}</div>
