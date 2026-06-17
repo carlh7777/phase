@@ -43,20 +43,36 @@ export function loadPreconDeckMap(): Promise<DeckMap | null> {
   return fetchPromise;
 }
 
+export interface UseDecksResult {
+  /** Catalog entries keyed by MTGJSON filename stem; `null` until the first fetch settles. */
+  decks: DeckMap | null;
+  loading: boolean;
+  loadError: boolean;
+}
+
 /**
  * Returns the preconstructed deck catalog keyed by deck id (MTGJSON filename
  * stem, e.g. `RedDeckB_10E`). Includes every deck above MIN_DECK_CARDS — each
  * entry carries a `coveragePct`, so consumers (e.g. the precon picker) can
  * apply their own coverage-floor filter rather than dropping decks at build
- * time. `null` while loading or on fetch failure.
+ * time.
  */
-export function useDecks(): DeckMap | null {
+export function useDecks(): UseDecksResult {
   const [decks, setDecks] = useState<DeckMap | null>(cached);
+  const [loading, setLoading] = useState(!cached);
+  const [loadError, setLoadError] = useState(false);
 
   useEffect(() => {
     if (cached) return;
-    loadPreconDeckMap().then((d) => { if (d) setDecks(d); });
+    loadPreconDeckMap().then((d) => {
+      setLoading(false);
+      if (d) {
+        setDecks(d);
+        return;
+      }
+      setLoadError(true);
+    });
   }, []);
 
-  return decks;
+  return { decks, loading, loadError };
 }

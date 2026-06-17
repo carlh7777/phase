@@ -31,7 +31,7 @@ vi.mock("../../../services/deckCompatibility", () => ({
 vi.mock("../../../hooks/useDecks", () => ({
   loadPreconDeckMap: vi.fn(),
   isCommanderPreconDeck: (deck: { type: string }) => deck.type === "Commander Deck",
-  useDecks: vi.fn(() => null),
+  useDecks: vi.fn(() => ({ decks: null, loading: true, loadError: false })),
 }));
 
 function saveDeck(name: string, deck: ParsedDeck): void {
