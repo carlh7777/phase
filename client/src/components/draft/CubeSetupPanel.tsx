@@ -169,7 +169,7 @@ export function CubeSetupPanel({ onStart, startLabel, disabled }: CubeSetupPanel
             fitContainer
             menuLayout="dropdown"
             wrapperClassName="w-full min-w-0"
-            className="min-h-[44px] rounded-lg border border-white/10 bg-black/30 px-3 py-2 text-sm text-white shadow-none hover:bg-black/30 focus-visible:ring-emerald-400/50"
+            className="min-h-[44px] !rounded-lg border border-white/10 !bg-black/30 px-3 !py-2 text-sm text-white shadow-none !hover:bg-black/30 !focus-visible:ring-emerald-400/50"
           />
         </label>
         <label className="flex flex-col gap-1">
