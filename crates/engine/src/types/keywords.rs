@@ -1376,6 +1376,25 @@ impl Keyword {
     pub fn sums_across_instances(&self) -> bool {
         matches!(self, Keyword::Toxic(_))
     }
+
+    /// CR 613.7: When multiple effects grant the same single-authoritative-value
+    /// keyword (one whose payload is the *current* effective value, not an
+    /// accumulating count), the most recently applied grant must replace any
+    /// earlier instance of the same kind rather than coexist with it — otherwise
+    /// readers that pick "the first match" (e.g. `find_map`) can read a stale
+    /// value while a different one is intended to be authoritative. Crew/Saddle
+    /// (CR 702.122/702.171, vehicle/mount crew-power) and Enchant (CR 702.5a,
+    /// an Aura's current legal-attachment filter, reachable via
+    /// `AddKeyword{Enchant(_)}` from `install_aura_continuous_effect`) are the
+    /// currently known members. Contrast `sums_across_instances` (Toxic, which
+    /// accumulates) and the default (Protection/Ward/Annihilator, which coexist
+    /// as separate instances per CR 702.16g).
+    pub fn overrides_same_kind_on_grant(&self) -> bool {
+        matches!(
+            self,
+            Keyword::Crew { .. } | Keyword::Enchant(_) | Keyword::Saddle(_)
+        )
+    }
 }
 
 /// Capitalize the first character of a string (for type name normalization).
@@ -2885,6 +2904,16 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Afterlife" => Ok(Keyword::Afterlife(uint(data))),
         "Fading" => Ok(Keyword::Fading(uint(data))),
         "Vanishing" => Ok(Keyword::Vanishing(uint(data))),
+        // CR 702.48: Offering — `Offering(String)` serializes as
+        // {"Offering": "<quality>"}; round-trip it back rather than dropping
+        // the keyword to Unknown on reload of card-data.json.
+        "Offering" => Ok(Keyword::Offering(
+            data.as_str().unwrap_or_default().to_string(),
+        )),
+        // Specialize (Alchemy Horizons: Baldur's Gate) — `Specialize(ManaCost)`
+        // serializes as {"Specialize": <ManaCost>}; round-trip it back to the
+        // typed variant so the synthesized specialize ability is not lost.
+        "Specialize" => mana(data).map(Keyword::Specialize),
         "Crew" => {
             // Struct variant: {"Crew": {"power": N, "once_per_turn": {...}}}.
             // A bare number is also accepted for forward/back compatibility.
@@ -4089,6 +4118,22 @@ mod tests {
         match kw {
             Keyword::Freerunning(_) => {} // cost shape validated by ManaCost deser
             other => panic!("expected Keyword::Freerunning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameterized_keywords_survive_serde_round_trip() {
+        // Serialize emits these as externally-tagged objects
+        // ({"Specialize": <ManaCost>}, {"Offering": "<quality>"}); the custom
+        // Deserialize must route them back through keyword_from_tagged rather
+        // than dropping them to Unknown on reload of card-data.json.
+        for kw in [
+            Keyword::Specialize(parse_keyword_mana_cost("{2}")),
+            Keyword::Offering("Fox".to_string()),
+        ] {
+            let json = serde_json::to_value(&kw).unwrap();
+            let deserialized: Keyword = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(kw, deserialized, "round-trip failed for {json}");
         }
     }
 
