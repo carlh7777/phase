@@ -44,7 +44,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 fn is_data_carrying_static(mode: &StaticMode) -> bool {
     matches!(
         mode,
-        StaticMode::ReduceAbilityCost { .. }
+        // CR 514.2: nullary marker static — runtime enforcement is the cleanup
+        // turn-based action in turns.rs::execute_cleanup, which skips removing
+        // marked damage from permanents matching an active such static's
+        // `affected` filter. Not registry-keyed (mirrors the marker cluster).
+        StaticMode::DamageNotRemovedDuringCleanup
+            | StaticMode::ReduceAbilityCost { .. }
             | StaticMode::ModifyActivationLimit { .. }
             | StaticMode::AdditionalLandDrop { .. }
             | StaticMode::ModifyCost { .. }
@@ -160,6 +165,14 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // with turns.rs::execute_untap_with_choices keeping a cap clamp as a
             // safety net. Parameterized — no registry entry; coverage support here.
             | StaticMode::MaxUntapPerType { .. }
+            // CR 509.1a + CR 509.1b: ExtraBlockers carries the additional-blocker
+            // count (Yare, Brave the Sands). Runtime enforcement is in
+            // combat.rs::extra_block_limit; the registry only keys Some(1)/None.
+            | StaticMode::ExtraBlockers { .. }
+            // CR 702.122a / 702.171a / 702.184a: CrewContribution carries the
+            // modifier kind + action list (Giant Ox, Hotshot Mechanic). Runtime
+            // enforcement is in static_abilities.rs::object_crew_power_contribution.
+            | StaticMode::CrewContribution { .. }
     )
 }
 
@@ -559,6 +572,17 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                     Comparator::NE => "≠",
                 };
                 parts.push(format!("mv {}{}", fmt_quantity(value), suffix))
+            }
+            FilterProp::ManaValueParity { parity } => {
+                let label = match parity {
+                    crate::types::ability::ParitySource::Fixed(parity) => {
+                        format!("{parity:?} mana value").to_lowercase()
+                    }
+                    crate::types::ability::ParitySource::LastNamedChoice => {
+                        "chosen odd/even mana value".to_string()
+                    }
+                };
+                parts.push(label);
             }
             FilterProp::ManaCostIn { costs } => {
                 parts.push(format!("mana cost in {costs:?}"));

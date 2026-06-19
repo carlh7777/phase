@@ -2966,6 +2966,10 @@ pub enum WaitingFor {
         /// cards. When false, they must select exactly count cards.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         up_to: bool,
+        /// CR 701.23b: Hidden-zone stated-quality searches may select fewer
+        /// than `count` cards even when the printed text is not an "up to" search.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allows_partial_find: bool,
         /// CR 608.2c: Selection-time constraint propagated from
         /// `Effect::SearchLibrary.selection_constraint` (e.g., "with different
         /// names"). Enforced by the Select-handler call site and used by the
@@ -3119,6 +3123,11 @@ pub enum WaitingFor {
         /// Zero for all non-blight EffectZoneChoice uses.
         #[serde(default)]
         count_param: u32,
+        /// CR 401.4: Explicit library placement for resolution-time
+        /// `PutAtLibraryPosition` choices. `None` = top (Brainstorm); `Some`
+        /// preserves bottom/nth placement across the choice round-trip.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_position: Option<LibraryPosition>,
         /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
         /// rather than effect resolution. Cost-payment choices require special
         /// handling for exile-link tracking (push_exiled_with_source_this_turn).
@@ -8198,6 +8207,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
@@ -8447,6 +8457,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).unwrap();
@@ -8549,6 +8560,7 @@ mod tests {
                 ward: None,
             }),
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).expect("serialize");

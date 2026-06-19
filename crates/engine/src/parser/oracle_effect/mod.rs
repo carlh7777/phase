@@ -56,15 +56,15 @@ pub(crate) use self::token::parse_token_description;
 
 use std::str::FromStr;
 
-use crate::parser::oracle_nom::error::OracleError;
+use crate::parser::oracle_nom::error::{oracle_err, OracleError};
 #[cfg(test)]
 use crate::parser::oracle_trigger::parse_trigger_line;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{anychar, multispace1, space1};
+use nom::character::complete::{anychar, multispace0, multispace1, space1};
 use nom::combinator::{all_consuming, eof, map, not, opt, peek, recognize, rest, value};
 use nom::multi::{many1, separated_list1};
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::bridge::nom_on_lower;
@@ -91,8 +91,8 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     BounceSelection, CardPlayMode, CastPermissionConstraint, CastingPermission, ChoiceType,
     ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
-    ContinuousModification, ControllerRef, DamageModification, DamageSource,
-    DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
+    ContinuousModification, ControllerRef, CopyRetargetPermission, DamageModification,
+    DamageSource, DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
     GameRestriction, IntensityScope, IterationKindBinding, LibraryPosition, ManaProduction,
     ManaSpendPermission, MultiTargetSpec, ObjectProperty, ObjectScope, OriginConstraint,
     PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
@@ -758,13 +758,75 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     })
 }
 
+/// CR 603.7: nom body for "copy the next [type] spell you cast this turn when
+/// you cast it[, optionally with copy retarget permission]".
+fn parse_copy_next_spell_when_cast_body(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, CopyRetargetPermission)> {
+    let (rest, spell_part) = preceded(
+        tag("copy the next "),
+        take_until(" you cast this turn when you cast it"),
+    )
+    .parse(input)?;
+    let (rest, _) = tag(" you cast this turn when you cast it").parse(rest)?;
+
+    let filter =
+        extract_when_next_spell_filter(spell_part.trim()).ok_or_else(|| oracle_err(spell_part))?;
+
+    let (rest, retarget) = alt((
+        map(
+            preceded(
+                pair(multispace0, opt(preceded(multispace0, tag(".")))),
+                all_consuming(sequence::parse_copy_retarget_clause),
+            ),
+            |_| CopyRetargetPermission::MayChooseNewTargets,
+        ),
+        value(
+            CopyRetargetPermission::KeepOriginalTargets,
+            all_consuming(eof),
+        ),
+    ))
+    .parse(rest)?;
+
+    Ok((rest, (filter, retarget)))
+}
+
+/// CR 603.7: Parse "copy the next [type] spell you cast this turn when you cast it"
+/// — a one-shot delayed trigger that copies the next matching spell at cast time.
+/// Tzaangor Shaman (issue #1191) uses this wording instead of "when you next cast …".
+fn try_parse_copy_next_spell_when_cast(tp: TextPair) -> Option<ParsedEffectClause> {
+    let (_, (combined_filter, retarget)) = all_consuming(parse_copy_next_spell_when_cast_body)
+        .parse(tp.lower)
+        .ok()?;
+
+    let inner = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CopySpell {
+            target: TargetFilter::TriggeringSource,
+            retarget,
+            copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
+        },
+    );
+
+    Some(build_when_next_delayed_trigger(
+        TriggerMode::SpellCast,
+        combined_filter,
+        inner,
+        None,
+    ))
+}
+
 pub(crate) fn try_parse_temporal_delayed_trigger_ability(
     text: &str,
     kind: AbilityKind,
 ) -> Option<AbilityDefinition> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let clause = try_parse_whenever_this_turn(tp).or_else(|| try_parse_when_next_event(tp))?;
+    let clause = try_parse_whenever_this_turn(tp)
+        .or_else(|| try_parse_when_next_event(tp))
+        .or_else(|| try_parse_copy_next_spell_when_cast(tp))?;
     Some(ability_definition_from_clause(kind, clause))
 }
 
@@ -4694,6 +4756,11 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 
     // CR 603.7: "When you next cast a [type] spell this turn, ..." — one-shot delayed trigger.
     if let Some(clause) = try_parse_when_next_event(tp) {
+        return clause;
+    }
+
+    // CR 603.7: "Copy the next [type] spell you cast this turn when you cast it."
+    if let Some(clause) = try_parse_copy_next_spell_when_cast(tp) {
         return clause;
     }
 
@@ -10940,6 +11007,23 @@ fn replace_definition_targets_with_parent(def: &mut AbilityDefinition) {
     }
 }
 
+/// CR 608.2c + CR 115.10a: True when an `Attach` effect names an explicit typed
+/// recipient ("attach … to a Samurai you control" — Gilgamesh; "attach it to a
+/// creature you control" — Stonehewer Giant). The chunk-loop anaphor rewriter
+/// must not collapse such recipients to `ParentTarget` just because the
+/// attachment side uses a set anaphor ("one of them").
+fn attach_recipient_is_explicitly_typed(target: &TargetFilter) -> bool {
+    match target {
+        TargetFilter::Typed(tf) => {
+            !tf.type_filters.is_empty() || tf.controller.is_some() || !tf.properties.is_empty()
+        }
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(attach_recipient_is_explicitly_typed)
+        }
+        _ => false,
+    }
+}
+
 /// Replace the target filter on an effect with ParentTarget.
 /// Used for anaphoric "it"/"that creature" references in compound sub-effects.
 fn replace_target_with_parent(effect: &mut Effect) {
@@ -10997,7 +11081,10 @@ fn replace_target_with_parent(effect: &mut Effect) {
         {
             *target = TargetFilter::ParentTarget;
         }
-        Effect::Attach { target, .. } if !matches!(target, TargetFilter::LastCreated) => {
+        Effect::Attach { target, .. }
+            if !matches!(target, TargetFilter::LastCreated)
+                && !attach_recipient_is_explicitly_typed(target) =>
+        {
             *target = TargetFilter::ParentTarget;
         }
         Effect::UnattachAll { target, .. } if !matches!(target, TargetFilter::LastCreated) => {
@@ -11083,6 +11170,30 @@ fn replace_target_with_self(effect: &mut Effect) {
         }
         Effect::Transform { target, .. } => {
             *target = TargetFilter::SelfRef;
+        }
+        Effect::GenericEffect {
+            target,
+            static_abilities,
+            ..
+        } => {
+            if target.as_ref().is_some_and(|target| {
+                matches!(
+                    target,
+                    TargetFilter::ParentTarget | TargetFilter::TriggeringSource
+                )
+            }) {
+                *target = Some(TargetFilter::SelfRef);
+            }
+            for static_def in static_abilities {
+                if static_def.affected.as_ref().is_some_and(|affected| {
+                    matches!(
+                        affected,
+                        TargetFilter::ParentTarget | TargetFilter::TriggeringSource
+                    )
+                }) {
+                    static_def.affected = Some(TargetFilter::SelfRef);
+                }
+            }
         }
         _ => {
             // Effects without a target field, or outside this anaphor class,
@@ -24064,14 +24175,87 @@ mod tests {
                     Effect::GenericEffect { static_abilities, .. }
                         if static_abilities
                             .iter()
-                            .any(|s| s.mode == StaticMode::CanAttackWithDefender)
+                            .any(|s| s.mode == StaticMode::CanAttackWithDefender
+                                && s.modifications.contains(
+                                    &ContinuousModification::AddStaticMode {
+                                        mode: StaticMode::CanAttackWithDefender,
+                                    },
+                                ))
                 )
             });
             assert!(
                 has_can_attack,
-                "{text:?}: expected a CanAttackWithDefender grant; chain effects: {effects:?}"
+                "{text:?}: expected a CanAttackWithDefender grant with AddStaticMode carrier; chain effects: {effects:?}"
             );
         }
+    }
+
+    #[test]
+    fn walking_bulwark_compound_grants_target_haste_and_defender_attack_permission() {
+        let def = parse_effect_chain(
+            "Until end of turn, target creature with defender gains haste, can attack as though it didn't have defender, and assigns combat damage equal to its toughness rather than its power",
+            AbilityKind::Activated,
+        );
+
+        let mut effects: Vec<&Effect> = Vec::new();
+        let mut node = Some(&def);
+        while let Some(d) = node {
+            effects.push(&d.effect);
+            node = d.sub_ability.as_deref();
+        }
+
+        let has_haste = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities
+                        .iter()
+                        .any(|s| s.modifications.contains(
+                            &ContinuousModification::AddKeyword {
+                                keyword: Keyword::Haste,
+                            },
+                        ))
+            )
+        });
+        assert!(
+            has_haste,
+            "expected target haste grant; chain effects: {effects:?}"
+        );
+
+        let has_can_attack = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities
+                        .iter()
+                        .any(|s| s.mode == StaticMode::CanAttackWithDefender
+                            && s.modifications.contains(
+                                &ContinuousModification::AddStaticMode {
+                                    mode: StaticMode::CanAttackWithDefender,
+                                },
+                            ))
+            )
+        });
+        assert!(
+            has_can_attack,
+            "expected CanAttackWithDefender grant; chain effects: {effects:?}"
+        );
+
+        let has_assign_toughness = effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities
+                        .iter()
+                        .any(|s| s
+                            .modifications
+                            .contains(&ContinuousModification::AssignDamageFromToughness))
+            )
+        });
+        assert!(
+            has_assign_toughness,
+            "expected combat damage assignment grant; chain effects: {effects:?}"
+        );
     }
 
     #[test]
@@ -27718,6 +27902,42 @@ mod tests {
         );
     }
 
+    /// CR 603.7 (issue #1191): Tzaangor Shaman — "copy the next instant or
+    /// sorcery spell you cast this turn when you cast it" must install a
+    /// one-shot delayed trigger, not a combat-damage CopySpell.
+    #[test]
+    fn effect_tzaangor_copy_next_spell_when_cast() {
+        let def = parse_effect_chain(
+            "Copy the next instant or sorcery spell you cast this turn when you cast it. \
+             You may choose new targets for the copy.",
+            AbilityKind::Spell,
+        );
+        let Effect::CreateDelayedTrigger {
+            condition,
+            effect: inner,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+        };
+        let DelayedTriggerCondition::WhenNextEvent { trigger, .. } = condition else {
+            panic!("expected WhenNextEvent, got {condition:?}");
+        };
+        assert_eq!(trigger.mode, crate::types::triggers::TriggerMode::SpellCast);
+        assert!(
+            matches!(
+                *inner.effect,
+                Effect::CopySpell {
+                    target: TargetFilter::TriggeringSource,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "expected inner CopySpell on triggering spell, got {:?}",
+            inner.effect
+        );
+    }
+
     #[test]
     fn effect_each_merfolk_creature_you_control_explores_uses_explore_all() {
         let e = parse_effect("Each Merfolk creature you control explores");
@@ -29477,6 +29697,61 @@ mod tests {
                         }
                     )),
                     "must contain CantBeBlocked: {mods:?}"
+                );
+                assert!(
+                    mods.iter()
+                        .any(|m| matches!(m, ContinuousModification::SetPower { value: 1 })),
+                    "must contain SetPower(1): {mods:?}"
+                );
+                assert!(
+                    mods.iter()
+                        .any(|m| matches!(m, ContinuousModification::SetToughness { value: 1 })),
+                    "must contain SetToughness(1): {mods:?}"
+                );
+            }
+            other => panic!("expected single GenericEffect, got {other:?}"),
+        }
+    }
+
+    /// CR 205.1b + CR 613.1d + CR 613.4b: Curious Colossus — a comma-list
+    /// continuous effect may combine lose-abilities (layer 6), additive type
+    /// change (layer 4), and fixed base P/T (layer 7b) with no printed duration.
+    /// The trailing "and has base power and toughness N/N" is a modifier
+    /// conjunct on the same subject, not a standalone imperative effect.
+    #[test]
+    fn comma_list_type_change_and_has_base_pt_parses_as_single_generic_effect() {
+        let def = parse_effect_chain(
+            "each creature target opponent controls loses all abilities, becomes a Coward in addition to its other types, and has base power and toughness 1/1",
+            AbilityKind::Spell,
+        );
+        assert!(
+            def.sub_ability.is_none(),
+            "must parse as a single clause, not split into sub_ability: {:?}",
+            def.sub_ability
+        );
+        match &*def.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(*duration, None);
+                let mods: Vec<_> = static_abilities
+                    .iter()
+                    .flat_map(|s| s.modifications.iter())
+                    .collect();
+                assert!(
+                    mods.iter()
+                        .any(|m| matches!(m, ContinuousModification::RemoveAllAbilities)),
+                    "must contain RemoveAllAbilities: {mods:?}"
+                );
+                assert!(
+                    mods.iter().any(|m| matches!(
+                        m,
+                        ContinuousModification::AddSubtype { subtype }
+                            if subtype == "Coward"
+                    )),
+                    "must contain AddSubtype(Coward): {mods:?}"
                 );
                 assert!(
                     mods.iter()
@@ -49825,6 +50100,94 @@ mod tests {
             },
             other => panic!("expected ZoneChangedThisWay condition on Attach, got {other:?}"),
         }
+    }
+
+    /// Gilgamesh, Master-at-Arms (issue #3286): any-number Equipment dig-from-among
+    /// plus CR 603.12 active-voice reflexive attach to Samurai.
+    #[test]
+    fn attach_just_moved_gilgamesh_any_number_equipment_reflexive_attach() {
+        use crate::types::ability::{TypeFilter, TypedFilter};
+
+        let def = parse_effect_chain(
+            "Look at the top six cards of your library. You may put any number of Equipment cards from among them onto the battlefield. Put the rest on the bottom of your library in a random order. When you put one or more Equipment onto the battlefield this way, you may attach one of them to a Samurai you control.",
+            AbilityKind::Spell,
+        );
+
+        let Effect::Dig {
+            count,
+            destination,
+            keep_count,
+            up_to,
+            filter,
+            rest_destination,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected outer Dig, got {:?}", def.effect);
+        };
+        assert_eq!(*count, QuantityExpr::Fixed { value: 6 });
+        assert_eq!(*destination, Some(Zone::Battlefield));
+        assert_eq!(*keep_count, Some(u32::MAX), "any number → unbounded keep");
+        assert!(*up_to);
+        assert!(
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { ref type_filters, .. })
+                    if type_filters.iter().any(
+                        |f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Equipment"))
+                    )
+            ),
+            "expected Equipment filter on Dig, got {filter:?}"
+        );
+        assert_eq!(*rest_destination, Some(Zone::Library));
+        assert!(
+            def.forward_result,
+            "Dig parent must forward the just-moved Equipment to the Attach sub_ability"
+        );
+
+        let attach = def
+            .sub_ability
+            .as_ref()
+            .expect("expected Attach sub_ability after Dig");
+        match &*attach.effect {
+            Effect::Attach { attachment, target } => {
+                assert!(
+                    matches!(attachment, TargetFilter::ParentTarget),
+                    "attachment should bind to a chosen moved Equipment, got {attachment:?}"
+                );
+                assert!(
+                    matches!(
+                        target,
+                        TargetFilter::Typed(TypedFilter {
+                            controller: Some(ControllerRef::You),
+                            ref type_filters,
+                            ..
+                        }) if type_filters.iter().any(
+                            |f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Samurai"))
+                        )
+                    ),
+                    "expected Samurai you control attach target, got {target:?}"
+                );
+            }
+            other => panic!("expected Attach sub_ability, got {other:?}"),
+        }
+        match &attach.condition {
+            Some(AbilityCondition::ZoneChangedThisWay { filter }) => match filter {
+                TargetFilter::Typed(t) => assert!(
+                    t.type_filters.iter().any(
+                        |f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Equipment"))
+                    ),
+                    "expected Equipment on ZoneChangedThisWay, got {:?}",
+                    t.type_filters
+                ),
+                other => panic!("expected Typed Equipment filter, got {other:?}"),
+            },
+            other => panic!("expected ZoneChangedThisWay condition on Attach, got {other:?}"),
+        }
+        assert!(
+            attach.optional,
+            "\"you may attach\" makes the attach step optional"
+        );
     }
 
     /// Quest for the Holy Relic / Stonehewer Giant pattern:

@@ -8897,6 +8897,7 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ability::ParitySource;
 
     fn typed_leg(filter: &TargetFilter) -> Option<&TypedFilter> {
         match filter {
@@ -9614,6 +9615,37 @@ mod tests {
         assert!(matches!(target, TargetFilter::ParentTarget));
     }
 
+    /// CR 608.2c + CR 301.5b: Gilgamesh attach body — moved Equipment binds on
+    /// the attachment side; the Samurai recipient stays explicitly typed.
+    #[test]
+    fn parse_attach_one_of_them_to_samurai_you_control() {
+        use crate::types::ability::{TypeFilter, TypedFilter};
+
+        let input = "attach one of them to a Samurai you control";
+        let lower = input.to_lowercase();
+        let result = parse_utility_imperative_ast(input, &lower, &mut ParseContext::default());
+        let Some(UtilityImperativeAst::Attach { attachment, target }) = result else {
+            panic!("{input}: expected Attach, got {result:?}");
+        };
+        assert!(
+            matches!(attachment, TargetFilter::ParentTarget),
+            "attachment should bind to a chosen moved Equipment, got {attachment:?}"
+        );
+        assert!(
+            matches!(
+                target,
+                TargetFilter::Typed(TypedFilter {
+                    controller: Some(ControllerRef::You),
+                    ref type_filters,
+                    ..
+                }) if type_filters.iter().any(
+                    |f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Samurai"))
+                )
+            ),
+            "expected Samurai you control attach target, got {target:?}"
+        );
+    }
+
     /// CR 608.2k regression — issue #319 sibling.
     /// "attach ~ to it" inside a typed-subject trigger ("Whenever a Samurai
     /// or Warrior you control attacks alone … attach this Equipment to it"
@@ -9728,6 +9760,28 @@ mod tests {
             filters[1],
             TargetFilter::Typed(TypedFilter::default().subtype("Spacecraft".to_string()))
         );
+    }
+
+    #[test]
+    fn parse_exile_each_creature_with_mana_value_chosen_quality() {
+        let input = "exile each creature with mana value of the chosen quality";
+        let lower = input.to_lowercase();
+        let result = parse_zone_counter_ast(input, &lower, &mut ParseContext::default());
+        let Some(ZoneCounterImperativeAst::Exile {
+            origin: None,
+            target: TargetFilter::Typed(filter),
+            all: true,
+            enter_with_counters,
+        }) = result
+        else {
+            panic!("{input}: expected mass exile parity filter, got {result:?}");
+        };
+
+        assert!(enter_with_counters.is_empty());
+        assert!(filter.type_filters.contains(&TypeFilter::Creature));
+        assert!(filter.properties.contains(&FilterProp::ManaValueParity {
+            parity: ParitySource::LastNamedChoice,
+        }));
     }
 
     #[test]

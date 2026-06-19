@@ -953,19 +953,20 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             cards,
             count,
             up_to,
+            allows_partial_find,
             constraint,
             ..
         } => {
-            // CR 701.23b/d: constrained (stated-quality) searches enumerate 0..=count
-            // so the legal-action set always contains the empty fail-to-find plus
-            // valid partials; pure-quantity exact-count searches enumerate only
-            // `count`. `combinations(_, 0)` returns `vec![vec![]]`, so the empty
-            // decline survives the constraint filter below.
-            let sizes: Vec<usize> = if *up_to || constraint.permits_partial_find() {
-                (0..=*count).collect()
-            } else {
-                vec![*count]
-            };
+            // CR 701.23b/d: "up to N", hidden-zone stated-quality searches, or
+            // explicit stated-quality selection constraints enumerate 0..=count
+            // so the legal-action set contains fail-to-find plus valid partials.
+            // Pure-quantity exact-count searches enumerate only `count`.
+            let sizes: Vec<usize> =
+                if *up_to || *allows_partial_find || constraint.permits_partial_find() {
+                    (0..=*count).collect()
+                } else {
+                    vec![*count]
+                };
             // Engine-side beam cap. Required (not optional) because every candidate
             // returned here flows into `PlannerServices::validate_candidates`, which
             // clones state + applies the action per candidate. Without a cap, a
@@ -4968,6 +4969,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
 
@@ -5676,6 +5678,7 @@ mod tests {
             count: 2,
             reveal: false,
             up_to: false,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::None,
             split: None,
         };
@@ -5697,6 +5700,7 @@ mod tests {
             count: 2,
             reveal: false,
             up_to: false,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
@@ -5757,6 +5761,7 @@ mod tests {
             count: 4,
             reveal: false,
             up_to: true,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
