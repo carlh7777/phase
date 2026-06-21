@@ -1081,14 +1081,13 @@ export function MyDecks({
           </h2>
           {mode === "manage" && (
             <div
-              role="tablist"
+              role="group"
               aria-label={t("myDecks.headingManage")}
               className="inline-flex w-fit max-w-full rounded-lg border border-white/10 p-0.5"
             >
               <button
                 type="button"
-                role="tab"
-                aria-selected={activeTab === "decks"}
+                aria-pressed={activeTab === "decks"}
                 onClick={() => setActiveTab("decks")}
                 className={`rounded-md px-3 py-3.5 text-xs font-medium whitespace-nowrap transition-colors sm:py-1.5 ${
                   activeTab === "decks"
@@ -1100,8 +1099,7 @@ export function MyDecks({
               </button>
               <button
                 type="button"
-                role="tab"
-                aria-selected={activeTab === "subscriptions"}
+                aria-pressed={activeTab === "subscriptions"}
                 onClick={() => setActiveTab("subscriptions")}
                 className={`rounded-md px-3 py-3.5 text-xs font-medium whitespace-nowrap transition-colors sm:py-1.5 ${
                   activeTab === "subscriptions"
