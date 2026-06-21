@@ -1080,10 +1080,17 @@ export function MyDecks({
             {mode === "manage" ? t("myDecks.headingManage") : t("myDecks.headingSelect")}
           </h2>
           {mode === "manage" && (
-            <div className="flex rounded-lg border border-white/10">
+            <div
+              role="tablist"
+              aria-label={t("myDecks.headingManage")}
+              className="inline-flex w-fit max-w-full rounded-lg border border-white/10 p-0.5"
+            >
               <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "decks"}
                 onClick={() => setActiveTab("decks")}
-                className={`rounded-l-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                className={`rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
                   activeTab === "decks"
                     ? "bg-white/10 text-white"
                     : "text-slate-400 hover:text-white"
@@ -1092,8 +1099,11 @@ export function MyDecks({
                 {t("myDecks.tabDecks")}
               </button>
               <button
+                type="button"
+                role="tab"
+                aria-selected={activeTab === "subscriptions"}
                 onClick={() => setActiveTab("subscriptions")}
-                className={`rounded-r-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+                className={`rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
                   activeTab === "subscriptions"
                     ? "bg-white/10 text-white"
                     : "text-slate-400 hover:text-white"
@@ -1113,7 +1123,7 @@ export function MyDecks({
           </button>
         )}
         {mode === "manage" && activeTab === "subscriptions" && (
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2 self-start sm:self-auto">
             <button
               onClick={handleRefreshAll}
               disabled={isRefreshing}
