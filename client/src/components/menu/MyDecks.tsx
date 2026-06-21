@@ -1090,7 +1090,7 @@ export function MyDecks({
                 role="tab"
                 aria-selected={activeTab === "decks"}
                 onClick={() => setActiveTab("decks")}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                className={`rounded-md px-3 py-3.5 text-xs font-medium whitespace-nowrap transition-colors sm:py-1.5 ${
                   activeTab === "decks"
                     ? "bg-white/10 text-white"
                     : "text-slate-400 hover:text-white"
@@ -1103,7 +1103,7 @@ export function MyDecks({
                 role="tab"
                 aria-selected={activeTab === "subscriptions"}
                 onClick={() => setActiveTab("subscriptions")}
-                className={`rounded-md px-3 py-1.5 text-xs font-medium whitespace-nowrap transition-colors ${
+                className={`rounded-md px-3 py-3.5 text-xs font-medium whitespace-nowrap transition-colors sm:py-1.5 ${
                   activeTab === "subscriptions"
                     ? "bg-white/10 text-white"
                     : "text-slate-400 hover:text-white"
