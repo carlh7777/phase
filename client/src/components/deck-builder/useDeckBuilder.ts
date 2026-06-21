@@ -414,7 +414,7 @@ export function useDeckBuilder({
     setDirty(true);
   }, [applyDeckToEditor]);
 
-  const handleSave = async () => {
+  const handleSave = useCallback(async () => {
     if (!deckName.trim()) return;
     // Save-time commander inference: when a Commander-format deck is shaped
     // like a 100-singleton list with no explicit commander, ask the engine
@@ -455,7 +455,17 @@ export function useDeckBuilder({
       title: t("toolbar.savedToastTitle"),
       description: t("toolbar.savedToastDescription", { name: nextName }),
     });
-  };
+  }, [
+    deckName,
+    isCommander,
+    currentDeck,
+    applyDeckToEditor,
+    format,
+    bracket,
+    savedDeckName,
+    showNotification,
+    t,
+  ]);
 
   // Clone = explicit duplicate. Unlike Save (which renames the current deck in
   // place), this always writes a NEW key and leaves the original untouched, then
