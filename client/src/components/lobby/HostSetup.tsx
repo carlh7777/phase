@@ -370,16 +370,11 @@ export function HostSetup({
     } ${extra}`;
   const formatMeta = availableFormats.find((f) => f.format === selectedFormat);
   const formatMenuGroups = useMemo((): MenuSelectGroup[] => {
-    const formats = isP2P
-      ? FORMAT_OPTIONS.filter(
-          (f) => FORMAT_DEFAULTS[f.format].min_players <= P2P_MAX_PEERS,
-        )
-      : FORMAT_OPTIONS;
     const groups: MenuSelectGroup[] = [];
     for (const group of (Object.keys(GROUP_ORDER) as FormatGroup[]).sort(
       (a, b) => GROUP_ORDER[a] - GROUP_ORDER[b],
     )) {
-      const groupFormats = formats.filter((f) => f.group === group);
+      const groupFormats = availableFormats.filter((f) => f.group === group);
       if (groupFormats.length === 0) continue;
       groups.push({
         label: group,
@@ -390,7 +385,7 @@ export function HostSetup({
       });
     }
     return groups;
-  }, [isP2P]);
+  }, [availableFormats]);
   const submitDisabled =
     hostDisabled || isSubmitting || hostingStatus !== "idle" || (aiSeats.length > 0 && !defaultAiDeck);
 
