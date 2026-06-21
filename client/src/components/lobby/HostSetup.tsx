@@ -350,11 +350,15 @@ export function HostSetup({
   // so any format whose minimum is reachable from that ceiling is listable.
   // Formats requiring more seats than the ceiling are hidden here to avoid
   // advertising a configuration we can't actually host.
-  const availableFormats = isP2P
-    ? FORMAT_OPTIONS.filter(
-        (f) => FORMAT_DEFAULTS[f.format].min_players <= P2P_MAX_PEERS,
-      )
-    : FORMAT_OPTIONS;
+  const availableFormats = useMemo(
+    () =>
+      isP2P
+        ? FORMAT_OPTIONS.filter(
+            (f) => FORMAT_DEFAULTS[f.format].min_players <= P2P_MAX_PEERS,
+          )
+        : FORMAT_OPTIONS,
+    [isP2P],
+  );
 
   // Shared field-input grammar (mockup Host-setup inputs).
   const inp =
@@ -366,11 +370,16 @@ export function HostSetup({
     } ${extra}`;
   const formatMeta = availableFormats.find((f) => f.format === selectedFormat);
   const formatMenuGroups = useMemo((): MenuSelectGroup[] => {
+    const formats = isP2P
+      ? FORMAT_OPTIONS.filter(
+          (f) => FORMAT_DEFAULTS[f.format].min_players <= P2P_MAX_PEERS,
+        )
+      : FORMAT_OPTIONS;
     const groups: MenuSelectGroup[] = [];
     for (const group of (Object.keys(GROUP_ORDER) as FormatGroup[]).sort(
       (a, b) => GROUP_ORDER[a] - GROUP_ORDER[b],
     )) {
-      const groupFormats = availableFormats.filter((f) => f.group === group);
+      const groupFormats = formats.filter((f) => f.group === group);
       if (groupFormats.length === 0) continue;
       groups.push({
         label: group,
@@ -381,7 +390,7 @@ export function HostSetup({
       });
     }
     return groups;
-  }, [availableFormats]);
+  }, [isP2P]);
   const submitDisabled =
     hostDisabled || isSubmitting || hostingStatus !== "idle" || (aiSeats.length > 0 && !defaultAiDeck);
 
