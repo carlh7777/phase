@@ -108,7 +108,7 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
               <button
                 onClick={handleRefreshAll}
                 disabled={loading === "all" || subs.length === 0}
-                className="self-start rounded px-3 py-1.5 text-xs text-slate-300 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:self-auto"
+                className="flex min-h-11 items-center justify-center self-start rounded px-3 py-1.5 text-xs text-slate-300 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:min-h-0 sm:self-auto"
               >
                 {loading === "all" ? t("feedManager.refreshing") : t("feedManager.refreshAll")}
               </button>
@@ -159,7 +159,7 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
                         <button
                           onClick={() => handleRefresh(source.id)}
                           disabled={isLoading}
-                          className="min-h-9 flex-1 rounded px-3 py-1.5 text-xs text-slate-400 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:flex-none sm:px-2 sm:py-1"
+                          className="min-h-11 flex-1 rounded px-3 py-1.5 text-xs text-slate-400 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:min-h-0 sm:flex-none sm:px-2 sm:py-1"
                         >
                           {isLoading ? "…" : t("feedManager.refresh")}
                         </button>
@@ -167,7 +167,7 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
                       <button
                         onClick={() => isSubscribed ? handleUnsubscribe(source.id) : handleSubscribe(source.id)}
                         disabled={isLoading}
-                        className={`min-h-9 flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40 sm:flex-none sm:py-1 ${
+                        className={`min-h-11 flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-40 sm:min-h-0 sm:flex-none sm:py-1 ${
                           isSubscribed
                             ? "text-red-300 ring-1 ring-red-500/30 hover:bg-red-500/10"
                             : "text-emerald-300 ring-1 ring-emerald-500/30 hover:bg-emerald-500/10"
@@ -196,13 +196,13 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
                       <button
                         onClick={() => handleRefresh(sub.sourceId)}
                         disabled={loading === sub.sourceId}
-                        className="min-h-9 flex-1 rounded px-3 py-1.5 text-xs text-slate-400 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:flex-none sm:px-2 sm:py-1"
+                        className="min-h-11 flex-1 rounded px-3 py-1.5 text-xs text-slate-400 ring-1 ring-white/10 transition-colors hover:bg-white/5 hover:text-white disabled:opacity-40 sm:min-h-0 sm:flex-none sm:px-2 sm:py-1"
                       >
                         {loading === sub.sourceId ? "…" : t("feedManager.refresh")}
                       </button>
                       <button
                         onClick={() => handleUnsubscribe(sub.sourceId)}
-                        className="min-h-9 flex-1 rounded px-3 py-1.5 text-xs font-medium text-red-300 ring-1 ring-red-500/30 transition-colors hover:bg-red-500/10 sm:flex-none sm:py-1"
+                        className="min-h-11 flex-1 rounded px-3 py-1.5 text-xs font-medium text-red-300 ring-1 ring-red-500/30 transition-colors hover:bg-red-500/10 sm:min-h-0 sm:flex-none sm:py-1"
                       >
                         {t("feedManager.unsubscribe")}
                       </button>
@@ -225,7 +225,7 @@ export function FeedManagerModal({ open, onClose }: FeedManagerModalProps) {
                 <button
                   onClick={handleCustomSubscribe}
                   disabled={!customUrl.trim() || loading === "custom"}
-                  className={`${menuButtonClass({ tone: "indigo", size: "sm", disabled: !customUrl.trim() || loading === "custom" })} min-h-10 w-full sm:w-auto`}
+                  className={`${menuButtonClass({ tone: "indigo", size: "sm", disabled: !customUrl.trim() || loading === "custom" })} w-full sm:w-auto`}
                 >
                   {loading === "custom" ? "…" : t("feedManager.add")}
                 </button>
