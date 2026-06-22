@@ -182,26 +182,24 @@ export function ServerPicker({ onClose, onApply }: ServerPickerProps) {
                 type="button"
                 onClick={() => testUrl(customUrl)}
                 disabled={!customUrl.trim() || connTest === "testing"}
-                className={
-                  menuButtonClass({
-                    tone: "neutral",
-                    size: "sm",
-                    disabled: !customUrl.trim() || connTest === "testing",
-                  }) + " flex-1 sm:flex-none"
-                }
+                className={menuButtonClass({
+                  tone: "neutral",
+                  size: "sm",
+                  disabled: !customUrl.trim() || connTest === "testing",
+                  className: "flex-1 sm:flex-none",
+                })}
               >
                 {t("serverPicker.test")}
               </button>
               <button
                 type="submit"
                 disabled={!customUrl.trim()}
-                className={
-                  menuButtonClass({
-                    tone: "cyan",
-                    size: "sm",
-                    disabled: !customUrl.trim(),
-                  }) + " flex-1 sm:flex-none"
-                }
+                className={menuButtonClass({
+                  tone: "cyan",
+                  size: "sm",
+                  disabled: !customUrl.trim(),
+                  className: "flex-1 sm:flex-none",
+                })}
               >
                 {t("serverPicker.use")}
               </button>
