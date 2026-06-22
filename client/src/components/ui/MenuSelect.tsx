@@ -248,10 +248,13 @@ export function MenuSelect({
     setMenuStyle(computeAnchoredMenuStyle(trigger));
   }, [useBottomSheet]);
 
+  const onOptionHoverRef = useRef(onOptionHover);
+  onOptionHoverRef.current = onOptionHover;
+
   const closeMenu = useCallback(() => {
     setOpen(false);
-    onOptionHover?.(null);
-  }, [onOptionHover]);
+    onOptionHoverRef.current?.(null);
+  }, []);
 
   const toggleOpen = useCallback(() => {
     if (disabled) return;
@@ -345,10 +348,10 @@ export function MenuSelect({
         onSelect(item.value);
         closeMenu();
       }}
-      onMouseEnter={() => onOptionHover?.(item.value)}
-      onMouseLeave={() => onOptionHover?.(null)}
-      onFocus={() => onOptionHover?.(item.value)}
-      onBlur={() => onOptionHover?.(null)}
+      onMouseEnter={() => onOptionHoverRef.current?.(item.value)}
+      onMouseLeave={() => onOptionHoverRef.current?.(null)}
+      onFocus={() => onOptionHoverRef.current?.(item.value)}
+      onBlur={() => onOptionHoverRef.current?.(null)}
       aria-selected={selectedValue === item.value}
       style={getOptionStyle?.(item)}
       className={[
