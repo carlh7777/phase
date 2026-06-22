@@ -32,8 +32,8 @@ use crate::types::ability::{
     CopyRetargetPermission, DoorLockOp, Duration, Effect, EffectScope, FaceDownProfile, FilterProp,
     LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PlayerScope, PreventionAmount,
     PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, SearchSelectionConstraint,
-    StaticDefinition, TapStateChange, TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter,
-    ZoneOwner,
+    StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetFilter, TargetSelectionMode,
+    TypeFilter, TypedFilter, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -126,6 +126,152 @@ fn parse_dig_library_owner(rest_lower: &str) -> TargetFilter {
     }
 
     TargetFilter::Controller
+}
+
+fn try_parse_put_sticker_effect(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<crate::types::ability::Effect> {
+    let text = lower.trim().trim_end_matches('.');
+    let (target_text, (count, kind, max_ticket_cost)) = parse_put_sticker_clause(text).ok()?;
+    if max_ticket_cost.is_some() && kind != Some(crate::types::stickers::StickerKind::Ability) {
+        return None;
+    }
+    let (_, (target_text, ticket_cost_payment)) =
+        parse_put_sticker_target_tail(target_text).ok()?;
+    let (target, rem) = parse_target_with_ctx(target_text.trim(), ctx);
+    if !rem.trim().is_empty() {
+        return None;
+    }
+    Some(Effect::PutSticker {
+        target,
+        kind,
+        count,
+        max_ticket_cost,
+        ticket_cost_payment,
+    })
+}
+
+fn parse_put_sticker_clause(
+    input: &str,
+) -> OracleResult<
+    '_,
+    (
+        QuantityExpr,
+        Option<crate::types::stickers::StickerKind>,
+        Option<QuantityExpr>,
+    ),
+> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("put ").parse(input)?;
+    let (input, count) = parse_sticker_count_expr(input)?;
+    let (input, kind) = parse_sticker_kind(input)?;
+    let (input, max_ticket_cost) = opt(preceded(
+        tag::<_, _, OracleError<'_>>(" with ticket cost "),
+        parse_sticker_max_ticket_cost,
+    ))
+    .parse(input)?;
+    let (input, _) = tag::<_, _, OracleError<'_>>(" on ").parse(input)?;
+    Ok((input, (count, kind, max_ticket_cost)))
+}
+
+fn parse_sticker_count_expr(input: &str) -> OracleResult<'_, QuantityExpr> {
+    alt((
+        map(
+            terminated(
+                preceded(
+                    tag::<_, _, OracleError<'_>>("up to "),
+                    parse_sticker_count_atom,
+                ),
+                tag(" "),
+            ),
+            QuantityExpr::up_to,
+        ),
+        terminated(parse_sticker_count_atom, tag(" ")),
+    ))
+    .parse(input)
+}
+
+fn parse_sticker_count_atom(input: &str) -> OracleResult<'_, QuantityExpr> {
+    alt((
+        value(
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            },
+            tag::<_, _, OracleError<'_>>("x"),
+        ),
+        map(nom_primitives::parse_number, |value| QuantityExpr::Fixed {
+            value: value as i32,
+        }),
+    ))
+    .parse(input)
+}
+
+fn parse_sticker_kind(
+    input: &str,
+) -> OracleResult<'_, Option<crate::types::stickers::StickerKind>> {
+    let (input, kind) = alt((
+        value(
+            Some(crate::types::stickers::StickerKind::PowerToughness),
+            tag::<_, _, OracleError<'_>>("power and toughness sticker"),
+        ),
+        value(
+            Some(crate::types::stickers::StickerKind::Name),
+            tag::<_, _, OracleError<'_>>("name sticker"),
+        ),
+        value(
+            Some(crate::types::stickers::StickerKind::Art),
+            tag::<_, _, OracleError<'_>>("art sticker"),
+        ),
+        value(
+            Some(crate::types::stickers::StickerKind::Ability),
+            tag::<_, _, OracleError<'_>>("ability sticker"),
+        ),
+        value(None, tag::<_, _, OracleError<'_>>("sticker")),
+    ))
+    .parse(input)?;
+    let (input, _) = opt(tag::<_, _, OracleError<'_>>("s")).parse(input)?;
+    Ok((input, kind))
+}
+
+fn parse_sticker_max_ticket_cost(input: &str) -> OracleResult<'_, QuantityExpr> {
+    let (rest, cost_text) = terminated(
+        take_until::<_, _, OracleError<'_>>(" or less"),
+        tag::<_, _, OracleError<'_>>(" or less"),
+    )
+    .parse(input)?;
+    let Some((expr, trailing)) = parse_count_expr(cost_text.trim()) else {
+        return Err(nom::Err::Error(OracleError::from_error_kind(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    };
+    if !trailing.trim().is_empty() {
+        return Err(nom::Err::Error(OracleError::from_error_kind(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((rest, expr))
+}
+
+fn parse_put_sticker_target_tail(
+    input: &str,
+) -> OracleResult<'_, (&str, StickerTicketCostPayment)> {
+    all_consuming(alt((
+        map(
+            terminated(
+                take_until::<_, _, OracleError<'_>>(" without paying that sticker's ticket cost"),
+                tag::<_, _, OracleError<'_>>(" without paying that sticker's ticket cost"),
+            ),
+            |target_text| (target_text, StickerTicketCostPayment::WithoutPaying),
+        ),
+        map(rest, |target_text| {
+            (target_text, StickerTicketCostPayment::PayNormally)
+        }),
+    )))
+    .parse(input)
 }
 
 /// Shared ControlNextTurn suffix parser (CR 723.1). Called after a prefix
@@ -3137,16 +3283,17 @@ pub(super) fn parse_for_each_player_choose_from_zone(
     // The body's zone reference is "that player's <zone>", which
     // `parse_choose_zone_connector` maps to `TargetedPlayer`; the "for each
     // player" prefix promotes it to per-player iteration (`EachPlayer`).
-    match try_parse_choose_from_zone(body, ctx)? {
-        ChooseImperativeAst::FromZone {
-            count,
-            zones,
-            zone_owner: ZoneOwner::TargetedPlayer,
-            filter,
-            chooser,
-            up_to,
-            selection,
-        } => Some(ChooseImperativeAst::FromZone {
+    if let Some(ChooseImperativeAst::FromZone {
+        count,
+        zones,
+        zone_owner: ZoneOwner::TargetedPlayer,
+        filter,
+        chooser,
+        up_to,
+        selection,
+    }) = try_parse_choose_from_zone(body, ctx)
+    {
+        return Some(ChooseImperativeAst::FromZone {
             count,
             zones,
             zone_owner: ZoneOwner::EachPlayer,
@@ -3154,8 +3301,170 @@ pub(super) fn parse_for_each_player_choose_from_zone(
             chooser,
             up_to,
             selection,
-        }),
-        _ => None,
+        });
+    }
+
+    // NOTE: the battlefield-control choose-only form ("for each player, choose
+    // [up to one] <type> that player controls" — Winnowing, Unstable Glyphbridge,
+    // Kitesail Larcenist) is intentionally NOT handled here. Their CHOOSE clause
+    // parses cleanly via `parse_controlled_battlefield_body`, but each card's
+    // downstream PAYLOAD is not yet supported end-to-end (Winnowing: per-player
+    // `ParentTarget` binding in the sacrifice sweep; Glyphbridge: "destroy all
+    // except creatures chosen this way" tracked-set exclusion; Kitesail: a
+    // duration-bound continuous effect on the chosen set). Emitting the choose
+    // here would yield a silently-wrong chain (the payload over-acts), which is
+    // strictly worse than an honest residual gap — so these stay Unimplemented
+    // until their payloads land. The combined choose+exile NON-target form (Kaya,
+    // below) is verified end-to-end and IS handled; its printed-`target` variant
+    // (CR 115.1c + CR 601.2c) needs announced per-iterated-player target slots the
+    // engine cannot yet model, so it is intentionally Unimplemented.
+    None
+}
+
+/// CR 608.2c + CR 608.2k: Parse the body shared by the per-player
+/// battlefield-control choose ("choose [up to one] [other] `<type>` that player
+/// controls") and exile ("exile [up to one] `<type>` that player controls",
+/// Kaya) forms — everything AFTER the verb head. Returns `(up_to, filter)`.
+///
+/// "up to one" → `up_to = true` (zero-or-one); a bare article ("a"/"an"/"one")
+/// is the mandatory single pick. "other " folds into the filter
+/// (`FilterProp::Another`, excluding the source).
+///
+/// The NON-target form is a resolution-scoped per-player choice (CR 608.2c +
+/// CR 115.10a: the affected permanent is chosen on resolution and is NOT a
+/// target). The printed-`target` form is different in kind — CR 115.1c +
+/// CR 601.2c require its targets to be announced as the ability is activated,
+/// chosen through the targeting machinery (legality / hexproof / shroud /
+/// protection enforced). The engine has no machinery for a variable,
+/// per-iterated-player set of announced target slots, so the printed-`target`
+/// variant is NOT representable as a resolution choice: this body rejects a
+/// leading `target ` (returns `None`) and the dispatcher falls through to
+/// `Effect::unimplemented`. The trailing "that player controls" relative-control
+/// clause is required (it is what distinguishes the battlefield-control form from
+/// the zone-noun form).
+fn parse_controlled_battlefield_body(
+    after_verb: &str,
+    ctx: &mut ParseContext,
+) -> Option<(bool, TargetFilter)> {
+    type E<'a> = OracleError<'a>;
+
+    let (after_qty, up_to) = alt((
+        value(true, tag::<_, _, E>("up to one ")),
+        value(false, tag("a ")),
+        value(false, tag("an ")),
+        value(false, tag("one ")),
+    ))
+    .parse(after_verb)
+    .ok()?;
+
+    let (after_other, exclude_source) = opt(value((), tag::<_, _, E>("other ")))
+        .parse(after_qty)
+        .ok()?;
+    // CR 115.1c + CR 601.2c: a printed `target` requires targets announced as the
+    // ability is activated, not a resolution choice. There is no machinery for a
+    // variable per-iterated-player set of announced target slots, so reject the
+    // printed-`target` variant here → dispatcher emits `Effect::unimplemented`.
+    if tag::<_, _, E>("target ").parse(after_other).is_ok() {
+        return None;
+    }
+
+    let (control_clause_start, _) = nom_primitives::scan_split_at_phrase(after_other, |i| {
+        value((), tag::<_, _, E>("that player controls")).parse(i)
+    })?;
+    let type_phrase = control_clause_start.trim_end();
+    if type_phrase.is_empty() {
+        return None;
+    }
+
+    let mut filter = super::search::parse_search_filter(type_phrase, ctx);
+    if matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+    if exclude_source.is_some() {
+        filter = add_filter_prop(filter, FilterProp::Another);
+    }
+    Some((up_to, filter))
+}
+
+/// CR 101.4 + CR 102.2 + CR 608.2c: "For each [other] player, exile [up to one]
+/// [target] `<type-phrase>` that player controls" — Kaya, Spirits' Justice's −2.
+/// The combined choose+exile per-iterated-player form: each iterated player's
+/// controlled permanent matching `<type-phrase>` is chosen (one per player,
+/// optionally zero via "up to one"), accumulated into the chain's tracked set,
+/// then ALL chosen permanents are exiled (`ChangeZoneAll { TrackedSet }`).
+///
+/// "for each player" iterates every player (`ZoneOwner::EachPlayer`); "for each
+/// other player" excludes the controller (`ZoneOwner::EachOpponent`). Emitted as
+/// a `ChooseFromZone { EachPlayer/EachOpponent }` clause with the mass-exile as
+/// its `sub_ability`, mirroring how the choose-only cards chain a separate
+/// "exile those" sentence.
+pub(super) fn parse_for_each_player_exile_controlled(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ParsedEffectClause> {
+    type E<'a> = OracleError<'a>;
+
+    let (after_prefix, iter_scope) = alt((
+        value(
+            ZoneOwner::EachOpponent,
+            tag::<_, _, E>("for each other player, "),
+        ),
+        value(ZoneOwner::EachOpponent, tag("for each other player ")),
+        value(ZoneOwner::EachPlayer, tag("for each player, ")),
+        value(ZoneOwner::EachPlayer, tag("for each player ")),
+    ))
+    .parse(lower)
+    .ok()?;
+
+    let (after_verb, _) = tag::<_, _, E>("exile ").parse(after_prefix).ok()?;
+    let (up_to, filter) = parse_controlled_battlefield_body(after_verb, ctx)?;
+
+    let choose = Effect::ChooseFromZone {
+        count: 1,
+        zone: Zone::Battlefield,
+        additional_zones: Vec::new(),
+        zone_owner: iter_scope,
+        filter: Some(filter),
+        chooser: Chooser::Controller,
+        up_to,
+        selection: CardSelectionMode::Chosen,
+        constraint: None,
+    };
+    // CR 400.7 + CR 608.2c: exile EVERY chosen permanent (`ChangeZoneAll` over
+    // the tracked set the per-player choose accumulated).
+    let exile_all = Effect::ChangeZoneAll {
+        origin: Some(Zone::Battlefield),
+        destination: Zone::Exile,
+        target: TargetFilter::TrackedSet {
+            id: crate::types::identifiers::TrackedSetId(0),
+        },
+        enters_under: None,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        enter_with_counters: vec![],
+        face_down_profile: None,
+        library_position: None,
+        random_order: false,
+    };
+    let sub = AbilityDefinition::new(AbilityKind::Spell, exile_all);
+
+    let mut clause = parsed_clause(choose);
+    clause.sub_ability = Some(Box::new(sub));
+    Some(clause)
+}
+
+/// Append a `FilterProp` (deduplicated) to a `Typed` filter. Non-`Typed` filters
+/// (`Any`, etc.) are returned unchanged — the callers only inject `Another` onto
+/// an already-typed `<type> that player controls` filter. Mirrors the
+/// property-injection idiom in `try_parse_choose_owned_by_voter`.
+fn add_filter_prop(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut tf) => {
+            if !tf.properties.contains(&prop) {
+                tf.properties.push(prop);
+            }
+            TargetFilter::Typed(tf)
+        }
+        other => other,
     }
 }
 
@@ -6896,6 +7205,31 @@ pub(super) fn parse_imperative_family_ast(
         }));
     }
 
+    if nom_on_lower(first_word, first_word, |i| value((), tag("put")).parse(i)).is_some() {
+        return if nom_primitives::scan_contains(lower, "that many")
+            && nom_primitives::scan_contains(lower, "counter")
+        {
+            try_parse_that_many_counters(lower, ctx)
+                .map(ImperativeFamilyAst::GainKeyword)
+                .or_else(|| {
+                    try_parse_put_sticker_effect(lower, ctx).map(ImperativeFamilyAst::GainKeyword)
+                })
+                .or_else(|| {
+                    parse_zone_counter_ast(text, lower, ctx)
+                        .map(ImperativeFamilyAst::ZoneCounter)
+                        .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put))
+                })
+        } else {
+            try_parse_put_sticker_effect(lower, ctx)
+                .map(ImperativeFamilyAst::GainKeyword)
+                .or_else(|| {
+                    parse_zone_counter_ast(text, lower, ctx)
+                        .map(ImperativeFamilyAst::ZoneCounter)
+                        .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put))
+                })
+        };
+    }
+
     // NOTE: when adding verbs here, also add them to IMPERATIVE_EXTRA_VERBS
     // in game/gap_analysis.rs so the parser gap analyzer can classify them.
     match first_word {
@@ -7333,6 +7667,15 @@ pub(super) fn parse_imperative_family_ast(
         }
         // Forage keyword action (CR 701.61a)
         "forage" => Some(ImperativeFamilyAst::GainKeyword(Effect::Forage)),
+        // CR 701.64a: "Harness [this permanent]" — always targets the source
+        // permanent (normalized to "~"). Guard on the self-reference so the verb
+        // does not match unrelated text; harnessing another permanent is not a
+        // printed pattern (CR 701.64a only ever harnesses "this permanent").
+        "harness" | "harnesses" => {
+            let rest = lower[first_word.len()..].trim().trim_end_matches('.').trim();
+            (rest.is_empty() || rest == "~")
+                .then_some(ImperativeFamilyAst::GainKeyword(Effect::Harness))
+        }
         // Collect evidence N keyword action (CR 702.163a)
         "collect" => {
             if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("collect evidence ").parse(lower)
@@ -7649,30 +7992,6 @@ pub(super) fn parse_imperative_family_ast(
             }
             None
         }
-
-        // ── Multi-category verbs (priority sub-dispatch) ──
-
-        // "put that many +1/+1 counters on ~" — dynamic counter count from event context.
-        // Intercepted before standard dispatch because parse_number can't handle "that many".
-        // Produces a PutCounter with the counter type and target, using EventContextAmount
-        // for the count. The engine resolver reads the count from the resolved ability's
-        // event_context_amount field.
-        "put"
-            if nom_primitives::scan_contains(lower, "that many")
-                && nom_primitives::scan_contains(lower, "counter") =>
-        {
-            try_parse_that_many_counters(lower, ctx)
-                .map(ImperativeFamilyAst::GainKeyword)
-                .or_else(|| {
-                    parse_zone_counter_ast(text, lower, ctx)
-                        .map(ImperativeFamilyAst::ZoneCounter)
-                        .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put))
-                })
-        }
-        // "put" → counter (step 2) first, then zone-change (step 12)
-        "put" => parse_zone_counter_ast(text, lower, ctx)
-            .map(ImperativeFamilyAst::ZoneCounter)
-            .or_else(|| parse_put_ast(text, lower, ctx).map(ImperativeFamilyAst::Put)),
 
         // "remove" → "remove from combat" (CR 506.4) → counter removal (step 2)
         "remove" => parse_remove_from_combat_ast(lower, ctx) // allow-noncombinator: pre-existing match dispatch, only threading ctx through

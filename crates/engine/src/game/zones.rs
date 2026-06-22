@@ -403,6 +403,10 @@ pub(crate) fn apply_zone_exit_cleanup(
         if !preserve_counters {
             obj_mut.counters.clear();
         }
+        if !crate::game::stickers::zone_retains_stickers(to) && !obj_mut.stickers.is_empty() {
+            obj_mut.stickers.clear();
+            obj_mut.revert_layered_characteristics_to_base();
+        }
     }
 
     if from == Zone::Battlefield {
@@ -424,12 +428,21 @@ pub(crate) fn apply_zone_exit_cleanup(
         state.objects_that_dealt_damage.remove(&object_id);
         super::layers::prune_host_left_effects(state, object_id);
         super::layers::prune_affected_object_left_effects(state, object_id);
+        // CR 611.2b + CR 400.7: the captured source leaving play, OR the host
+        // leaving and re-entering as a new object (same storage ObjectId), ends
+        // the "can't become untapped for as long as you control [source]"
+        // continuous effect permanently — drop the gated def from base+live so
+        // it cannot revive on a same-ObjectId re-entry.
+        super::layers::prune_controller_controls_source_on_leave(state, object_id);
         // CR 613.1 + CR 400.7: Copy effects are pruned above, but layer-derived
         // characteristics (name, types, abilities) persist on the object until
         // explicitly reset. Revert to printed baseline so graveyard/exile objects
         // do not retain copied identity (Vesuva legend-rule sacrifice).
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.revert_layered_characteristics_to_base();
+            if crate::game::stickers::zone_retains_stickers(to) && !obj.stickers.is_empty() {
+                crate::game::stickers::rebuild_public_zone_stickers(obj);
+            }
         }
         for tapped in state.lands_tapped_for_mana.values_mut() {
             tapped.retain(|&id| id != object_id);

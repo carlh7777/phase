@@ -1541,6 +1541,12 @@ fn ability_word_to_condition(word: &str) -> Option<crate::types::ability::Static
     };
 
     match word {
+        // CR 702.186a/b: "∞ — [Ability]" is the Infinity static ability; the
+        // ∞ keyword maps to the harnessed gate ("as long as this permanent is
+        // harnessed, it has [Ability]"). `strip_ability_word_with_name` already
+        // splits the `∞ — ` prefix generically, so this only needs the mapping.
+        // allow-noncombinator: semantic mapping after ability-word parser has classified the word
+        "∞" => Some(StaticCondition::SourceIsHarnessed),
         "threshold" => Some(StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
                 qty: QuantityRef::GraveyardSize {
@@ -1734,6 +1740,9 @@ fn ability_word_to_trigger_condition(
             rhs,
         }),
         StaticCondition::HasMaxSpeed => Some(TriggerCondition::HasMaxSpeed),
+        // CR 702.186b: the ∞ ability word gates its triggered ability on the
+        // harnessed designation.
+        StaticCondition::SourceIsHarnessed => Some(TriggerCondition::SourceIsHarnessed),
         _ => None,
     }
 }
@@ -2658,6 +2667,16 @@ pub(crate) fn parse_oracle_ir(
         if let Some(colon_pos) = find_activated_colon(&line) {
             let cost_text = line[..colon_pos].trim();
             let effect_text = line[colon_pos + 1..].trim();
+            // CR 207.2c (shared label-prefix mechanism, used by ability words
+            // like Threshold) + CR 702.186a: the ∞ keyword (NOT an ability word —
+            // it is absent from the CR 207.2c list) is likewise followed by
+            // ability text after an em-dash and can prefix an activation cost
+            // ("∞ — {T}: ..."). `find_activated_colon` strips the label only to
+            // locate the colon; the prefix is still in `cost_text` here, so
+            // recover the typed gate condition (shared `strip_ability_word_with_name`
+            // path serves both forms) to gate this ability.
+            let aw_condition = strip_ability_word_with_name(cost_text)
+                .and_then(|(aw_name, _)| ability_word_to_condition(&aw_name));
             let (mut def, effect_text) = parse_activated_ability_definition(
                 cost_text,
                 effect_text,
@@ -2666,6 +2685,18 @@ pub(crate) fn parse_oracle_ir(
                 Some(result.abilities.len()),
                 &mut ctx,
             );
+            // CR 702.186b: ∞ ("As long as harnessed, it has [ability]") gates an
+            // activated ability's legality (the ability is absent while
+            // unharnessed) — an activation restriction, NOT an intervening-if
+            // `condition` (a resolution-time gate, CR 608.2c + Shelldock Isle
+            // ruling, which the engine deliberately does not use for activation
+            // legality). Applied AFTER the call because
+            // `parse_activated_ability_definition` overwrites
+            // `activation_restrictions` from the cost-text constraints.
+            if matches!(aw_condition, Some(StaticCondition::SourceIsHarnessed)) {
+                def.activation_restrictions
+                    .push(ActivationRestriction::SourceIsHarnessed);
+            }
             if ability_cant_be_copied {
                 def.cant_be_copied = true;
             }
@@ -2707,11 +2738,12 @@ pub(crate) fn parse_oracle_ir(
         }
 
         // CR 603.7a-b: Instant/sorcery text like "Whenever [event] this turn, ..."
-        // creates a delayed triggered ability during resolution. It is not a
-        // permanent's printed triggered ability, so spell cards must get one
-        // chance to route trigger-shaped temporal text through the effect parser
-        // before generic trigger dispatch.
-        if is_spell && has_trigger_prefix(&lower) && scan_contains(&lower, "this turn") {
+        // or "At the beginning of your next upkeep, ..." creates a delayed
+        // triggered ability during resolution. It is not a permanent's printed
+        // triggered ability, so spell cards must get one chance to route
+        // trigger-shaped temporal text through the effect parser before generic
+        // trigger dispatch.
+        if is_spell && has_trigger_prefix(&lower) {
             if let Some(def) = try_parse_temporal_delayed_trigger_ability(&line, AbilityKind::Spell)
             {
                 result.abilities.push(def);
@@ -6642,6 +6674,66 @@ mod tests {
         assert_eq!(
             static_def.affected,
             Some(crate::types::ability::TargetFilter::Any)
+        );
+    }
+
+    /// CR 118.9: Valgavoth, Terror Eater — the cast-from-exile static line
+    /// ("During your turn, you may play cards exiled with ~. If you cast a spell
+    /// this way, pay life equal to its mana value rather than pay its mana
+    /// cost.") must be a fully-supported `ExileCastPermission` carrying an
+    /// ALTERNATIVE pay-life extra-cost (not a leftover Unimplemented gap).
+    #[test]
+    fn valgavoth_terror_eater_cast_from_exile_alt_cost_supported() {
+        use crate::types::statics::{CastCostMode, StaticMode};
+        let face = oracle_face_for(
+            "Valgavoth, Terror Eater",
+            "Flying, lifelink\nWard\u{2014}Sacrifice three nonland permanents.\nIf a card you didn't control would be put into an opponent's graveyard from anywhere, exile it instead.\nDuring your turn, you may play cards exiled with Valgavoth. If you cast a spell this way, pay life equal to its mana value rather than pay its mana cost.",
+            &["Legendary", "Creature"],
+            &["Demon"],
+        );
+        let details = crate::game::coverage::build_parse_details_for_face(&face);
+        let cast_static = details
+            .iter()
+            .find(|d| {
+                matches!(d.category, crate::game::coverage::ParseCategory::Static)
+                    // allow-noncombinator: matching the engine's own parse-detail handler label (not Oracle text), in a test.
+                    && d.label.starts_with("ExileCastPermission")
+            })
+            .expect(
+                "Valgavoth's cast-from-exile line must appear as an ExileCastPermission static",
+            );
+        assert!(
+            cast_static.supported,
+            "the cast-from-exile static line must be supported, got {cast_static:?}"
+        );
+
+        // Pin the structural variant: a persistent Play permission carrying an
+        // ALTERNATIVE pay-life extra-cost.
+        let static_def = face
+            .static_abilities
+            .iter()
+            .find(|s| matches!(s.mode, StaticMode::ExileCastPermission { .. }))
+            .expect("Valgavoth must emit an ExileCastPermission static");
+        let StaticMode::ExileCastPermission {
+            play_mode,
+            ref extra_cost,
+            ..
+        } = static_def.mode
+        else {
+            unreachable!("matched ExileCastPermission above");
+        };
+        assert_eq!(play_mode, crate::types::ability::CardPlayMode::Play);
+        let extra = extra_cost
+            .as_ref()
+            .expect("Valgavoth must carry an alternative extra-cost");
+        assert_eq!(extra.mode, CastCostMode::Alternative);
+        assert!(
+            matches!(
+                extra.cost,
+                crate::types::ability::AbilityCost::PayLife { .. }
+            ),
+            "Valgavoth's alternative cost must be PayLife, got {:?}",
+            extra.cost
         );
     }
 
@@ -13806,6 +13898,71 @@ mod tests {
         // CR 609.3: "twice" → repeat_for = Fixed(2), resolver handles repetition.
         assert_eq!(def.repeat_for, Some(QuantityExpr::Fixed { value: 2 }));
         assert!(def.sub_ability.is_none());
+    }
+
+    #[test]
+    fn put_name_sticker_parses() {
+        use crate::parser::oracle_effect::parse_effect;
+        let effect = parse_effect("put a name sticker on target creature you own");
+        assert!(
+            matches!(
+                effect,
+                Effect::PutSticker {
+                    kind: Some(crate::types::stickers::StickerKind::Name),
+                    count: QuantityExpr::Fixed { value: 1 },
+                    max_ticket_cost: None,
+                    ticket_cost_payment:
+                        crate::types::ability::StickerTicketCostPayment::PayNormally,
+                    ..
+                }
+            ),
+            "expected PutSticker name effect, got {:?}",
+            effect,
+        );
+    }
+
+    #[test]
+    fn put_ticket_bounded_ability_sticker_parses() {
+        use crate::parser::oracle_effect::parse_effect;
+        let effect = parse_effect(
+            "put an ability sticker with ticket cost 2 or less on target nonland permanent you own without paying that sticker's ticket cost",
+        );
+        assert!(
+            matches!(
+                effect,
+                Effect::PutSticker {
+                    kind: Some(crate::types::stickers::StickerKind::Ability),
+                    count: QuantityExpr::Fixed { value: 1 },
+                    max_ticket_cost: Some(QuantityExpr::Fixed { value: 2 }),
+                    ticket_cost_payment:
+                        crate::types::ability::StickerTicketCostPayment::WithoutPaying,
+                    ..
+                }
+            ),
+            "expected bounded ability-sticker effect, got {:?}",
+            effect,
+        );
+    }
+
+    #[test]
+    fn put_up_to_two_name_stickers_parses() {
+        use crate::parser::oracle_effect::parse_effect;
+        let effect = parse_effect("put up to two name stickers on target creature you own");
+        assert!(
+            matches!(
+                effect,
+                Effect::PutSticker {
+                    kind: Some(crate::types::stickers::StickerKind::Name),
+                    count: QuantityExpr::UpTo { .. },
+                    max_ticket_cost: None,
+                    ticket_cost_payment:
+                        crate::types::ability::StickerTicketCostPayment::PayNormally,
+                    ..
+                }
+            ),
+            "expected up-to-two name-sticker effect, got {:?}",
+            effect,
+        );
     }
 
     #[test]

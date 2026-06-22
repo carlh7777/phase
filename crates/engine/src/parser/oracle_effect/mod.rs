@@ -1052,8 +1052,36 @@ pub(crate) fn try_parse_temporal_delayed_trigger_ability(
     let tp = TextPair::new(text, &lower);
     let clause = try_parse_whenever_this_turn(tp)
         .or_else(|| try_parse_when_next_event(tp))
-        .or_else(|| try_parse_copy_next_spell_when_cast(tp))?;
+        .or_else(|| try_parse_copy_next_spell_when_cast(tp))
+        .or_else(|| try_parse_at_next_phase_delayed_trigger(text, kind))?;
     Some(ability_definition_from_clause(kind, clause))
+}
+
+/// CR 603.7a: Pact-cycle instants ("At the beginning of your next upkeep, pay
+/// {2}{G}{G}. If you don't, you lose the game.") install a one-shot delayed
+/// trigger when the spell resolves — not a printed battlefield Phase trigger.
+fn try_parse_at_next_phase_delayed_trigger(
+    text: &str,
+    kind: AbilityKind,
+) -> Option<ParsedEffectClause> {
+    let (effect_text, condition) = strip_temporal_prefix(text);
+    let condition = condition?;
+    let mut ctx = ParseContext::default();
+    let inner = parse_effect_chain_with_context(effect_text, kind, &mut ctx);
+    Some(ParsedEffectClause {
+        effect: Effect::CreateDelayedTrigger {
+            condition,
+            effect: Box::new(inner),
+            uses_tracked_set: false,
+        },
+        duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
 }
 
 /// CR 614.1a + CR 514.2: Detect "If [target_phrase] would die this turn, exile
@@ -1222,6 +1250,64 @@ fn parse_optional_period_and_end(input: &str) -> Option<()> {
         .parse(input)
         .ok()?;
     rest.trim().is_empty().then_some(())
+}
+
+/// CR 701.26b + CR 614.6 + CR 611.2b: Detect a "that creature/permanent can't
+/// become untapped" rider that follows a tap-target clause (Spider-Woman, Secret
+/// Agent: "tap target creature an opponent controls. That creature can't become
+/// untapped for as long as you control ~."). Returns an `AddTargetReplacement`
+/// that installs the BROAD untap prohibition (CR 701.26b — blocks every untap
+/// path, not just the untap step) onto the previously-chosen target.
+///
+/// The carried replacement uses `valid_card: SelfRef` because once it's pushed
+/// onto the target object's `replacement_definitions` by the
+/// `AddTargetReplacement` resolver, `SelfRef` binds to that host — which IS the
+/// tapped creature. `target: TargetFilter::Any` inherits the parent tap clause's
+/// chosen target (the sub-ability target-propagation in `resolve_ability_chain`).
+///
+/// The CR 611.2b "for as long as you control ~" duration is NOT encoded here:
+/// the clause shell peels that trailing duration onto the sub-ability frame
+/// (`Duration::UntilHostLeavesPlay`), and the `AddTargetReplacement` install
+/// chokepoint translates it into a `ControllerControlsSource` gate stamped with
+/// the real originating source/controller. A bare "can't become untapped" with
+/// no duration installs the permanent prohibition (no gate).
+fn try_parse_cant_become_untapped_target_rider(lower: &str) -> Option<Effect> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("that creature"),
+        tag("that permanent"),
+        tag("it"),
+    ))
+    .parse(lower)
+    .ok()?;
+    // CR 701.26b: "can't become untapped" / "can't be untapped" — the broad
+    // prohibition. The same prefix is shared with the static Blossombind line
+    // (`oracle_replacement::parse_cant_become_untapped_replacement`); the
+    // distinguishing subject ("that creature"/"it") routes the demonstrative
+    // anaphoric form here.
+    let (rest, _) = (
+        tag::<_, _, OracleError<'_>>(" can"),
+        alt((tag("'t"), tag("\u{2019}t"))),
+        tag(" "),
+        alt((tag("become "), tag("be "))),
+        tag("untapped"),
+    )
+        .parse(rest)
+        .ok()?;
+    parse_optional_period_and_end(rest)?;
+
+    // CR 614.6: bare prevention (no `execute`). The `untap_applier` returns
+    // `Prevented` when the replacement carries no alternative effect. No
+    // `condition` is set here: the install chokepoint translates the peeled
+    // "for as long as you control ~" duration into a `ControllerControlsSource`
+    // gate. A bare "can't become untapped" (no duration) installs permanently.
+    let replacement = ReplacementDefinition::new(ReplacementEvent::Untap)
+        .valid_card(TargetFilter::SelfRef)
+        .description("can't become untapped".to_string());
+
+    Some(Effect::AddTargetReplacement {
+        replacement: Box::new(replacement),
+        target: TargetFilter::Any,
+    })
 }
 
 fn parse_damage_source_subject(input: &str) -> Option<&str> {
@@ -5195,6 +5281,12 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     if let Some(effect) = try_parse_cast_this_way_enters_with_counter(&lower) {
         return parsed_clause(effect);
     }
+    // CR 701.26b + CR 614.6 + CR 611.2b: "That creature can't become untapped
+    // [for as long as you control ~]" rider following a tap-target clause
+    // (Spider-Woman). Installs the broad untap prohibition on the chosen target.
+    if let Some(effect) = try_parse_cant_become_untapped_target_rider(&lower) {
+        return parsed_clause(effect);
+    }
     // CR 614.1a + CR 608.2n + CR 607.2b: "exile it instead of putting it into a
     // graveyard as it resolves" — the resolving-spell exile rider applied by a
     // `WhenAPlayerCasts` trigger to the triggering spell (Rod of Absorption).
@@ -5395,6 +5487,20 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         if let Some(ast) = imperative::parse_category_and_sacrifice_rest_pub(after_prefix) {
             return parsed_clause(imperative::lower_choose_ast(ast));
         }
+    }
+
+    // CR 101.4 + CR 102.2 + CR 608.2c: "For each [other] player, exile [up to
+    // one] <type> that player controls" — Kaya, Spirits' Justice's −2. The
+    // combined per-iterated-player choose + mass-exile-those form. Checked before
+    // the choose-from-zone dispatcher because its verb is "exile", and it returns
+    // a `ChooseFromZone { EachPlayer/EachOpponent }` clause whose `sub_ability` is
+    // the `ChangeZoneAll { TrackedSet }` exile. The printed-`target` variant
+    // (CR 115.1c + CR 601.2c, "exile up to one TARGET <type>…") is intentionally
+    // NOT handled — its targets must be announced at activation, which the engine
+    // cannot model as a per-iterated-player set — so it falls through to
+    // `Effect::unimplemented`.
+    if let Some(clause) = imperative::parse_for_each_player_exile_controlled(tp.lower, ctx) {
+        return clause;
     }
 
     // CR 101.4 + CR 608.2c: "For each player, choose a <filter> card in that
@@ -12421,8 +12527,13 @@ fn replace_target_with_parent(effect: &mut Effect) {
         } => {
             *target = Some(TargetFilter::ParentTarget);
             for static_def in static_abilities {
-                if matches!(static_def.affected, Some(TargetFilter::SelfRef)) {
-                    static_def.affected = Some(TargetFilter::ParentTarget);
+                if let Some(affected) = static_def.affected.as_mut() {
+                    if matches!(
+                        affected,
+                        TargetFilter::SelfRef | TargetFilter::TriggeringSource
+                    ) {
+                        *affected = TargetFilter::ParentTarget;
+                    }
                 }
             }
         }
@@ -34063,6 +34174,50 @@ mod tests {
             )),
             "modifications must contain AddStaticMode(CantBeBlockedBy), got {:?}",
             static_def.modifications
+        );
+    }
+
+    /// Issue #3990: Ms. Bumbleflower — "Put a +1/+1 counter on target creature.
+    /// It gains flying until end of turn." must grant flying to the counter
+    /// target, not the trigger source.
+    #[test]
+    fn bumbleflower_it_gains_flying_binds_to_counter_target() {
+        let def = parse_effect_chain(
+            "Target opponent draws a card. Put a +1/+1 counter on target creature. It gains flying until end of turn.",
+            AbilityKind::Spell,
+        );
+        let draw = &*def.effect;
+        let put_counter = def
+            .sub_ability
+            .as_ref()
+            .expect("draw -> put counter chain")
+            .sub_ability
+            .as_ref()
+            .expect("put counter -> flying chain");
+        assert!(matches!(draw, Effect::Draw { .. }));
+        let Effect::PutCounter { target, .. } = &*def.sub_ability.as_ref().unwrap().effect else {
+            panic!(
+                "expected PutCounter, got {:?}",
+                def.sub_ability.as_ref().unwrap().effect
+            );
+        };
+        assert!(!matches!(target, TargetFilter::ParentTarget));
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = &*put_counter.effect
+        else {
+            panic!(
+                "expected GenericEffect flying grant, got {:?}",
+                put_counter.effect
+            );
+        };
+        assert_eq!(target, &Some(TargetFilter::ParentTarget));
+        assert_eq!(
+            static_abilities[0].affected,
+            Some(TargetFilter::ParentTarget),
+            "flying grant must affect the counter target, not TriggeringSource"
         );
     }
 

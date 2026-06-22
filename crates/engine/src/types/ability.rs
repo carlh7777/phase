@@ -23,6 +23,7 @@ use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
 use super::replacements::ReplacementEvent;
 use super::statics::{ActivationExemption, CastFrequency, StaticMode};
+use super::stickers::{AppliedSticker, StickerKind};
 use super::triggers::TriggerMode;
 use super::zones::{EtbTapState, Zone};
 use crate::game::game_object::DisplaySource;
@@ -66,6 +67,14 @@ pub enum ZoneOwner {
     /// Building block for Breach the Multiverse ("For each player, choose a
     /// creature or planeswalker card in that player's graveyard").
     EachPlayer,
+    /// CR 101.4 + CR 102.2 + CR 608.2c: Every OPPONENT of the controller owns a
+    /// referenced zone, iterated in APNAP order (the controller is excluded).
+    /// The each-opponent leaf of the per-player iteration axis — same
+    /// accumulate-into-tracked-set machinery as [`ZoneOwner::EachPlayer`], but
+    /// the controller's own permanents are never offered. Building block for
+    /// Kaya, Spirits' Justice's −2 ("For each other player, exile up to one
+    /// target creature that player controls").
+    EachOpponent,
 }
 
 /// CR 105.1 + CR 205.2: A fixed, closed enumeration whose members an effect
@@ -5453,6 +5462,12 @@ pub enum StaticCondition {
     /// Read from `GameObject::monstrous` (existing bool field).
     /// Used for "as long as this creature is monstrous" statics (Fleecemane Lion, etc.).
     SourceIsMonstrous,
+    /// CR 701.64b + CR 702.186b: True when the source permanent is harnessed.
+    /// Read from `GameObject::harnessed`. This is the ∞ (Infinity) ability gate:
+    /// "∞ — [Ability]" grants [Ability] only while the permanent is harnessed.
+    /// Sibling of `SourceIsMonstrous` — a distinct CR designation marker, not a
+    /// parameterization of it (each marker is its own CR 701.x designation).
+    SourceIsHarnessed,
     /// CR 301.5 + CR 303.4: True when the source Aura/Equipment is attached to a creature.
     /// All observed Oracle text uses "attached to a creature"; no filter parameter needed.
     /// Used for "as long as this Equipment is attached to a creature" statics (Pact Weapon, etc.).
@@ -9271,6 +9286,32 @@ pub enum Effect {
     },
     /// CR 701.52: Roll to visit your Attractions.
     RollToVisitAttractions,
+    /// CR 123.3: Put one or more stickers you have access to on a target object.
+    PutSticker {
+        #[serde(default = "default_target_filter_any")]
+        target: TargetFilter,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<StickerKind>,
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_ticket_cost: Option<QuantityExpr>,
+        #[serde(
+            default,
+            alias = "without_paying",
+            deserialize_with = "deserialize_sticker_ticket_cost_payment",
+            skip_serializing_if = "is_default_sticker_ticket_cost_payment"
+        )]
+        ticket_cost_payment: StickerTicketCostPayment,
+    },
+    /// Runtime-selected sticker application branch used by `PutSticker`.
+    ApplySticker {
+        #[serde(default = "default_target_filter_any")]
+        target: TargetFilter,
+        sticker: AppliedSticker,
+        #[serde(default)]
+        pay_ticket: bool,
+    },
     /// CR 728.1: Process rad counters — mill cards equal to rad counter count,
     /// lose 1 life and remove one rad counter per nonland card milled.
     ProcessRadCounters,
@@ -9854,6 +9895,12 @@ pub enum Effect {
     Learn,
     /// CR 701.61a: Forage — exile three cards from your graveyard or sacrifice a Food.
     Forage,
+    /// CR 701.64a: Harness [this permanent] — if the source permanent isn't
+    /// harnessed, it becomes harnessed. A unit keyword action (no parameters):
+    /// it always designates the source permanent, mirroring `Forage`'s
+    /// argument-free shape. The harnessed designation (CR 701.64b) is read by
+    /// the ∞ (Infinity) ability gate via `SourceIsHarnessed`.
+    Harness,
     /// CR 702.163a: Collect evidence N — exile cards with total mana value N or more from graveyard.
     CollectEvidence {
         #[serde(default = "default_one")]
@@ -10030,6 +10077,39 @@ pub enum Effect {
         #[serde(default)]
         description: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StickerTicketCostPayment {
+    #[default]
+    PayNormally,
+    WithoutPaying,
+}
+
+fn is_default_sticker_ticket_cost_payment(mode: &StickerTicketCostPayment) -> bool {
+    *mode == StickerTicketCostPayment::PayNormally
+}
+
+fn deserialize_sticker_ticket_cost_payment<'de, D>(
+    deserializer: D,
+) -> Result<StickerTicketCostPayment, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Repr {
+        Legacy(bool),
+        Tagged(StickerTicketCostPayment),
+    }
+
+    Ok(match Option::<Repr>::deserialize(deserializer)? {
+        None => StickerTicketCostPayment::PayNormally,
+        Some(Repr::Legacy(true)) => StickerTicketCostPayment::WithoutPaying,
+        Some(Repr::Legacy(false)) => StickerTicketCostPayment::PayNormally,
+        Some(Repr::Tagged(mode)) => mode,
+    })
 }
 
 fn default_one() -> u32 {
@@ -10840,6 +10920,8 @@ impl Effect {
             | Effect::SetLifeTotal { target, .. }
             | Effect::GiveControl { target, .. }
             | Effect::RemoveFromCombat { target, .. }
+            | Effect::PutSticker { target, .. }
+            | Effect::ApplySticker { target, .. }
             | Effect::ProliferateTarget { target, .. }
             // CR 115.7 + CR 115.1: "Change the target of target spell or ability"
             // (Bolt Bend, Redirect, Misdirection) targets the stack spell/ability
@@ -11109,6 +11191,7 @@ impl Effect {
             | Effect::Adapt { .. }
             | Effect::Learn
             | Effect::Forage
+            | Effect::Harness
             | Effect::CollectEvidence { .. }
             | Effect::Endure { .. }
             | Effect::ExploreAll { .. }
@@ -11348,6 +11431,7 @@ impl Effect {
             | Effect::FlipCoin { .. }
             | Effect::FlipCoinUntilLose { .. }
             | Effect::Forage
+            | Effect::Harness
             | Effect::FreeCastFromZones { .. }
             | Effect::GiftDelivery { .. }
             | Effect::GrantCastingPermission { .. }
@@ -11361,6 +11445,8 @@ impl Effect {
             | Effect::MiracleCast { .. }
             | Effect::OpenAttractions { .. }
             | Effect::PayCost { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ApplySticker { .. }
             | Effect::ProcessRadCounters
             | Effect::ReduceNextSpellCost { .. }
             | Effect::RevealFromHand { .. }
@@ -11563,6 +11649,7 @@ impl Effect {
             | Effect::FlipCoin { .. }
             | Effect::FlipCoinUntilLose { .. }
             | Effect::Forage
+            | Effect::Harness
             | Effect::FreeCastFromZones { .. }
             | Effect::GiftDelivery { .. }
             | Effect::GrantCastingPermission { .. }
@@ -11576,6 +11663,8 @@ impl Effect {
             | Effect::MiracleCast { .. }
             | Effect::OpenAttractions { .. }
             | Effect::PayCost { .. }
+            | Effect::PutSticker { .. }
+            | Effect::ApplySticker { .. }
             | Effect::ProcessRadCounters
             | Effect::ReduceNextSpellCost { .. }
             | Effect::RevealFromHand { .. }
@@ -11739,6 +11828,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::Planeswalk => "Planeswalk",
         Effect::OpenAttractions { .. } => "OpenAttractions",
         Effect::RollToVisitAttractions => "RollToVisitAttractions",
+        Effect::PutSticker { .. } => "PutSticker",
+        Effect::ApplySticker { .. } => "ApplySticker",
         Effect::ProcessRadCounters => "ProcessRadCounters",
         Effect::GrantCastingPermission { .. } => "GrantCastingPermission",
         Effect::ChooseFromZone { .. } => "ChooseFromZone",
@@ -11790,6 +11881,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         },
         Effect::Learn => "Learn",
         Effect::Forage => "Forage",
+        Effect::Harness => "Harness",
         Effect::CollectEvidence { .. } => "CollectEvidence",
         Effect::Endure { .. } => "Endure",
         Effect::BlightEffect { .. } => "BlightEffect",
@@ -11953,6 +12045,8 @@ pub enum EffectKind {
     Planeswalk,
     OpenAttractions,
     RollToVisitAttractions,
+    PutSticker,
+    ApplySticker,
     ProcessRadCounters,
     GrantCastingPermission,
     ChooseFromZone,
@@ -12001,6 +12095,7 @@ pub enum EffectKind {
     RuntimeHandled,
     Learn,
     Forage,
+    Harness,
     CollectEvidence,
     Endure,
     BlightEffect,
@@ -12176,6 +12271,8 @@ impl From<&Effect> for EffectKind {
             Effect::Planeswalk => EffectKind::Planeswalk,
             Effect::OpenAttractions { .. } => EffectKind::OpenAttractions,
             Effect::RollToVisitAttractions => EffectKind::RollToVisitAttractions,
+            Effect::PutSticker { .. } => EffectKind::PutSticker,
+            Effect::ApplySticker { .. } => EffectKind::ApplySticker,
             Effect::ProcessRadCounters => EffectKind::ProcessRadCounters,
             Effect::GrantCastingPermission { .. } => EffectKind::GrantCastingPermission,
             Effect::ChooseFromZone { .. } => EffectKind::ChooseFromZone,
@@ -12229,6 +12326,7 @@ impl From<&Effect> for EffectKind {
             Effect::RuntimeHandled { .. } => EffectKind::RuntimeHandled,
             Effect::Learn => EffectKind::Learn,
             Effect::Forage => EffectKind::Forage,
+            Effect::Harness => EffectKind::Harness,
             Effect::CollectEvidence { .. } => EffectKind::CollectEvidence,
             Effect::Endure { .. } => EffectKind::Endure,
             Effect::BlightEffect { .. } => EffectKind::BlightEffect,
@@ -12496,6 +12594,11 @@ pub enum ActivationRestriction {
     },
     /// CR 719.3c: This ability can only be activated while the source Case is solved.
     IsSolved,
+    /// CR 701.64b + CR 702.186b: This ability is present only while the source
+    /// permanent is harnessed, so it can only be activated while harnessed.
+    /// Read from `GameObject::harnessed`. Sibling of `IsSolved` (CR 719.3c) — a
+    /// per-object designation activation gate, not a parameterization of it.
+    SourceIsHarnessed,
     /// CR 716.4: Level N+1 ability can only activate when the source Class is at exactly this level.
     ClassLevelIs {
         level: u8,
@@ -14122,6 +14225,12 @@ pub enum TriggerCondition {
     /// CR 716.2a: True when the source Class enchantment is at or above the given level.
     /// Used to gate continuous triggers that only become active at higher class levels.
     ClassLevelGE { level: u8 },
+    /// CR 701.64b + CR 702.186b: True when the source permanent is harnessed.
+    /// The intervening-if counterpart of `StaticCondition::SourceIsHarnessed` —
+    /// gates an ∞ (Infinity) triggered ability so it only fires while the
+    /// permanent is harnessed. Mirrors `ClassLevelGE`'s "active only past a
+    /// per-object designation" gating.
+    SourceIsHarnessed,
     /// CR 701.52a + CR 702.159a: Visit ability on a numbered attraction line —
     /// the roll from `AttractionVisited` must fall within the printed range.
     AttractionVisitRoll { min: u8, max: u8 },
@@ -14685,6 +14794,32 @@ pub enum ReplacementCondition {
     /// instead" — Freyalise's Winds, Edge of Malacol) so it does NOT apply to
     /// effect-untaps ("untap target creature") at other times.
     DuringUntapStep,
+    /// CR 611.2b: "for as long as you control [source]" continuous-effect
+    /// duration, encoded as a replacement applicability gate. The replacement
+    /// applies only while `source` is on the battlefield AND still controlled by
+    /// `controller`. When the captured source object leaves the battlefield or
+    /// its controller changes, the gate goes false and the replacement stops
+    /// applying — exactly the CR 611.2b lifetime (the Master Thief example: the
+    /// effect ends when you lose control of the source).
+    ///
+    /// Both `source` and `controller` are captured at install time by the
+    /// `AddTargetReplacement` resolver (parse time uses the `ObjectId(0)` /
+    /// `PlayerId(0)` sentinels). This is required because the gate is evaluated
+    /// against the *host* the replacement rides on (the chosen creature, an
+    /// opponent's permanent): the threaded `controller`/`source_id` in
+    /// `evaluate_replacement_condition` describe that host, NOT the originating
+    /// source (Spider-Woman) or its controller. Carrying both explicitly is the
+    /// only way to re-check "you still control [the originating source]".
+    ///
+    /// Distinct from the `Unless*Controls*` / `IfControlsMatching` family
+    /// (CR 614.1c/d), which gate on a *count of permanents matching a filter*;
+    /// this gates on continued control of one specific captured object — a
+    /// different axis (CR 611.2b duration vs CR 614.1 quantity), so not a
+    /// sibling-cluster smell.
+    ControllerControlsSource {
+        source: ObjectId,
+        controller: PlayerId,
+    },
     /// "unless you revealed a [type] card" / "unless you paid {mana}"
     /// CR 614.1d — Generic condition text that the engine does not yet decompose further.
     /// Using this variant lets the replacement be recognized for coverage while deferring

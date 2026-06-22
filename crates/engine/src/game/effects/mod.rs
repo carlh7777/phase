@@ -114,6 +114,7 @@ pub mod gift_delivery;
 pub mod goad;
 pub mod grant_extra_loyalty_activations;
 pub mod grant_permission;
+pub mod harness;
 pub mod heist;
 pub mod hideaway;
 pub mod incubate;
@@ -182,6 +183,7 @@ pub mod solve_case;
 pub mod specialize;
 pub mod speed_effects;
 pub mod spellbook;
+pub mod stickers;
 pub mod turn_face_up;
 // Tests for `spellbook` live in a sibling file (declared here, not in
 // `spellbook.rs`, so `spellbook.rs` stays implementation-only).
@@ -213,6 +215,7 @@ pub(crate) fn effect_object_targets(
     fallback_targets: &[TargetRef],
 ) -> Vec<ObjectId> {
     match target_filter {
+        TargetFilter::SpecificObject { id } => vec![*id],
         TargetFilter::ParentTargetSlot { index } => fallback_targets
             .get(*index)
             .and_then(|target| match target {
@@ -2836,6 +2839,7 @@ pub fn resolve_effect(
         Effect::BlightEffect { .. } => blight::resolve(state, ability, events),
         Effect::Endure { .. } => endure::resolve(state, ability, events),
         Effect::Forage => forage::resolve(state, ability, events),
+        Effect::Harness => harness::resolve(state, ability, events),
         Effect::CollectEvidence { .. } => collect_evidence::resolve(state, ability, events),
         Effect::SetLifeTotal { .. } => life::resolve_set_life_total(state, ability, events),
         Effect::ExchangeLifeWithStat { .. } => exchange_life::resolve(state, ability, events),
@@ -2854,6 +2858,9 @@ pub fn resolve_effect(
         Effect::Planeswalk => planeswalk::resolve(state, ability, events),
         Effect::OpenAttractions { .. } | Effect::RollToVisitAttractions => {
             attractions::resolve(state, ability, events)
+        }
+        Effect::PutSticker { .. } | Effect::ApplySticker { .. } => {
+            stickers::resolve(state, ability, events)
         }
         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
