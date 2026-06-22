@@ -163,7 +163,7 @@ export function HostSetup({
   hostDisabled = false,
   hostDisabledReason,
 }: HostSetupProps) {
-  const { t } = useTranslation("multiplayer");
+  const { t } = useTranslation(["multiplayer", "menu"]);
   // Player name is edited in `PlayerIdentityBanner` above this form (see
   // MultiplayerPage). We read it here only to submit it and to seed the
   // room-name placeholder — this form itself intentionally has no
