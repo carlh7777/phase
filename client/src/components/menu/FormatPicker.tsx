@@ -69,7 +69,7 @@ interface FormatPickerProps {
 
 export function FormatPicker({ onFormatSelect }: FormatPickerProps) {
   return (
-    <div className="flex w-full max-w-3xl flex-col gap-6 pb-8 sm:gap-8 sm:pb-10">
+    <div className="flex w-full max-w-3xl flex-col gap-6 sm:gap-8">
       {FORMAT_GROUPS.map((group) => {
         const tone = GROUP_TONES[group.tone];
         return (
