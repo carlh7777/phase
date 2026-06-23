@@ -1814,6 +1814,13 @@ pub enum CollectEvidenceResume {
     Effect {
         pending_ability: Box<ResolvedAbility>,
     },
+    /// CR 605.2 + CR 701.59: Collect evidence paid as a mana ability's
+    /// activation cost (Cryptex's `{T}, Collect evidence 3: Add one mana...`).
+    /// Resumes the parked mana-ability activation with the chosen cards stamped
+    /// into `PendingManaAbility::collected_evidence`, rather than a `PendingCast`.
+    ManaAbility {
+        pending_mana_ability: Box<PendingManaAbility>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1927,6 +1934,18 @@ pub struct PendingManaAbility {
     /// in a mana-ability cost. The amount is chosen before mana production.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chosen_counter_count: Option<u32>,
+    /// CR 107.3a + CR 601.2b + CR 702.179e/f: Announced value of X for a
+    /// `Pay X speed` mana-ability cost (Chicago Loop's `Pay X speed: Add X mana
+    /// in any combination of colors`). Chosen before cost payment and mana
+    /// production; bound to BOTH the speed cost and the produced-mana count via
+    /// `set_chosen_x_recursive`. `None` until the player announces X.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen_x: Option<u32>,
+    /// CR 605.2 + CR 701.59: Cards exiled to pay a `Collect evidence N`
+    /// mana-ability cost (Cryptex). Filled by the `CollectEvidenceChoice` resume
+    /// before mana production; empty until the player selects cards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collected_evidence: Vec<ObjectId>,
     /// CR 117.1 + CR 118.3: Pre-selected objects to exile as part of an
     /// `AbilityCost::Exile { filter: !SelfRef, .. }` mana ability cost. Used
     /// by Food Chain's battlefield exile cost and Titans' Nest's graveyard
@@ -4246,6 +4265,11 @@ pub enum PayableResource {
     /// CR 119.4: Pay any amount of life — N is deducted as life loss via
     /// life_costs::pay_life_as_cost (life-loss replacement pipeline + CantLoseLife).
     Life,
+    /// CR 702.179e/f: Announce X for a `Pay X speed` mana-ability cost. The chosen
+    /// amount is the announced X, bounded above by the player's current speed
+    /// (CR 702.179f: no speed counts as 0). Mana-ability only — paid via the
+    /// `PendingManaAbility::chosen_x` path, never the standalone resource branch.
+    Speed,
 }
 
 fn default_one() -> u32 {
@@ -4590,7 +4614,8 @@ impl WaitingFor {
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_ref() {
                 CollectEvidenceResume::Casting { pending_cast } => Some(pending_cast),
-                CollectEvidenceResume::Effect { .. } => None,
+                CollectEvidenceResume::Effect { .. }
+                | CollectEvidenceResume::ManaAbility { .. } => None,
             },
             _ => None,
         }
@@ -4621,7 +4646,8 @@ impl WaitingFor {
             },
             WaitingFor::CollectEvidenceChoice { resume, .. } => match resume.as_mut() {
                 CollectEvidenceResume::Casting { pending_cast } => Some(pending_cast),
-                CollectEvidenceResume::Effect { .. } => None,
+                CollectEvidenceResume::Effect { .. }
+                | CollectEvidenceResume::ManaAbility { .. } => None,
             },
             _ => None,
         }
@@ -5524,6 +5550,15 @@ pub struct GameState {
     /// prevented and replaced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_replacement_event_target: Option<crate::types::ability::TargetRef>,
+
+    /// CR 701.50a + CR 614.5 + CR 616.1f: deferred connive link of a connive
+    /// replacement whose leading draw parked a replacement-ordering choice. See
+    /// `PendingConniveReentry`. Drained only by
+    /// `engine_replacement::handle_replacement_choice` (accept and decline) —
+    /// never by the shared zone-delivery tail. Transient; serde-skipped when None;
+    /// `.take()`-cleared at drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_connive_reentry: Option<PendingConniveReentry>,
 
     /// Transient: post-resolution context for a permanent spell whose ETB replacement
     /// needs a player choice (NeedsChoice). Consumed by `handle_replacement_choice`
@@ -6804,6 +6839,28 @@ pub struct TransientContinuousEffect {
     pub source_name: String,
 }
 
+/// CR 701.50a + CR 614.5 + CR 616.1f: deferred "then that creature connives"
+/// link of a connive replacement whose LEADING `Draw` link parked an interactive
+/// `ReplacementChoice` (the controller's own draw is itself replaced). CR 701.50a's
+/// replacement reads "instead you draw a card, THEN that creature connives" — the
+/// "then" fixes the printed order, so the connive must run only AFTER the parked
+/// draw choice resolves. Held in a DEDICATED slot (NOT
+/// `post_replacement_continuation`) so the shared zone-delivery tail
+/// (`apply_zone_delivery_tail`, `DeliveryTail` owner) cannot drain it mid-draw —
+/// it is drained ONLY by the post-replacement-choice epilogue
+/// (`engine_replacement::handle_replacement_choice`), after the leading draw fully
+/// delivers, on both the accept and decline resume paths. On drain it re-enters
+/// the pipeline via `propose_connive` with the already-applied rids excluded
+/// (CR 614.5) so the CR 616.1f repeat covers the remaining connive replacements
+/// without self-invoking. (CR 614.11a — completing a replacement's actions before
+/// resuming a draw — is the analogous supporting principle.)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingConniveReentry {
+    pub conniver: ObjectId,
+    pub count: u32,
+    pub applied: HashSet<ReplacementId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingReplacement {
     pub proposed: ProposedEvent,
@@ -7133,6 +7190,7 @@ impl GameState {
             post_replacement_source: None,
             post_replacement_event_source: None,
             post_replacement_event_target: None,
+            pending_connive_reentry: None,
             pending_spell_resolution: None,
             pending_mutate_merge: None,
             deferred_entry_events: Vec::new(),
@@ -7591,6 +7649,7 @@ impl PartialEq for GameState {
             && self.max_lands_per_turn == other.max_lands_per_turn
             && self.priority_pass_count == other.priority_pass_count
             && self.pending_replacement == other.pending_replacement
+            && self.pending_connive_reentry == other.pending_connive_reentry
             && self.pending_spell_resolution == other.pending_spell_resolution
             && self.deferred_entry_events == other.deferred_entry_events
             && self.layers_dirty == other.layers_dirty
@@ -8471,6 +8530,8 @@ mod tests {
                     chosen_discards: Vec::new(),
                     chosen_mana_payment: None,
                     chosen_counter_count: None,
+                    chosen_x: None,
+                    collected_evidence: Vec::new(),
                     chosen_exiled: Vec::new(),
                     chosen_sacrificed_battlefield: Vec::new(),
                     cost_paid_object: None,

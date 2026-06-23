@@ -1,7 +1,7 @@
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, CostPaidObjectSnapshot, Effect,
-    ManaProduction, ResolvedAbility, TargetFilter, REMOVE_COUNTER_COST_ALL,
-    REMOVE_COUNTER_COST_ANY_NUMBER,
+    ManaProduction, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter,
+    REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_ANY_NUMBER,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::{GameEvent, ManaTapState};
@@ -15,6 +15,7 @@ use crate::types::mana::{ManaColor, ManaCost, ManaPool, ManaType, PaymentContext
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
+use std::collections::HashSet;
 
 use super::cost_payability::{eligible_exile_cost_objects, exile_cost_effective_zone};
 use super::effects::mana::resolve_restrictions;
@@ -200,8 +201,49 @@ pub fn resolve_mana_ability(
     events: &mut Vec<GameEvent>,
     color_override: Option<ProductionOverride>,
 ) -> Result<(), EngineError> {
+    // CR 605.3c: A top-level mana-ability activation has no suspended ancestor
+    // on the call stack, so the in-flight exclusion chain starts empty. The
+    // source itself is added downstream in `pay_mana_sub_cost`.
+    resolve_mana_ability_excluding(
+        state,
+        source_id,
+        player,
+        ability_def,
+        events,
+        color_override,
+        &HashSet::new(),
+    )
+}
+
+/// Resolve a mana ability while excluding an in-flight chain of ancestor
+/// mana-ability sources from the cost-payment auto-tap (CR 605.3c). Called by
+/// the casting auto-tap (`auto_tap_mana_sources_inner`) when paying one mana
+/// ability's mana sub-cost forces activation of further mana abilities: each
+/// ancestor activation is synchronously suspended mid-payment on the Rust call
+/// stack and must not be re-activated, or the auto-tap recurses infinitely
+/// (two cross-paying Signets, an N-source chain, or a self-loop).
+pub(super) fn resolve_mana_ability_excluding(
+    state: &mut GameState,
+    source_id: ObjectId,
+    player: PlayerId,
+    ability_def: &AbilityDefinition,
+    events: &mut Vec<GameEvent>,
+    color_override: Option<ProductionOverride>,
+    excluded_sources: &HashSet<ObjectId>,
+) -> Result<(), EngineError> {
     // Pay the full ability cost (tap, sacrifice, etc.)
-    pay_mana_ability_cost(state, source_id, player, &ability_def.cost, events)?;
+    let waiting_before_cost = state.waiting_for.clone();
+    pay_mana_ability_cost(
+        state,
+        source_id,
+        player,
+        &ability_def.cost,
+        events,
+        excluded_sources,
+    )?;
+    if state.waiting_for != waiting_before_cost {
+        return Ok(());
+    }
 
     // CR 117.1 + CR 202.3: This non-interactive entry point is reachable only
     // when no cost-paid-object snapshot is needed (no battlefield exile
@@ -244,6 +286,11 @@ fn produce_mana_from_ability(
         source_id,
         player,
         ability_def,
+        // CR 107.3c: X is irrelevant here — `ProductionOverride::Combination`
+        // short-circuits `AnyCombination` count resolution (the produced
+        // sequence was pre-chosen by the player), and the produced count X is
+        // enforced via the prompt path's `AnyCombination { count: X }`.
+        None,
         cost_paid_object,
     );
 
@@ -333,12 +380,19 @@ fn resolved_mana_ability_for_current_state(
     source_id: ObjectId,
     player: PlayerId,
     ability_def: &AbilityDefinition,
+    chosen_x: Option<u32>,
     cost_paid_object: Option<CostPaidObjectSnapshot>,
 ) -> ResolvedAbility {
     let mut resolved =
         super::ability_utils::build_resolved_from_def(ability_def, source_id, player);
     if let Some(snapshot) = cost_paid_object {
         resolved.set_cost_paid_object_recursive(snapshot);
+    }
+    // CR 107.3a/.3c: bind the announced X into the resolved ability so produced
+    // mana counts (`AnyCombination { count: Ref(Variable "X") }`) and any X-bearing
+    // sub-effects resolve to the chosen value (Chicago Loop's `Add X mana`).
+    if let Some(x) = chosen_x {
+        resolved.set_chosen_x_recursive(x);
     }
     apply_condition_instead_mana_swap(state, &resolved)
 }
@@ -462,6 +516,8 @@ pub fn activate_mana_ability(
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -1062,6 +1118,29 @@ fn can_activate_mana_ability_by_simulation(
     .is_ok()
 }
 
+// CR 701.59: collect-evidence amount inside a (possibly composite) mana-ability cost.
+pub(crate) fn collect_evidence_cost_amount(cost: &AbilityCost) -> Option<u32> {
+    match cost {
+        AbilityCost::CollectEvidence { amount } => Some(*amount),
+        AbilityCost::Composite { costs } => costs.iter().find_map(collect_evidence_cost_amount),
+        _ => None,
+    }
+}
+
+// CR 107.3a + CR 702.179f: a mana-ability cost of "Pay X speed".
+fn pay_speed_x_cost(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::PaySpeed {
+            amount:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name },
+                },
+        } if name == "X" => true,
+        AbilityCost::Composite { costs } => costs.iter().any(pay_speed_x_cost),
+        _ => false,
+    }
+}
+
 pub(super) fn advance_mana_ability_activation(
     state: &mut GameState,
     mut pending: PendingManaAbility,
@@ -1073,6 +1152,32 @@ pub(super) fn advance_mana_ability_activation(
         .and_then(|obj| obj.abilities.get(pending.ability_index))
         .cloned()
         .ok_or_else(|| EngineError::InvalidAction("Mana ability no longer exists".to_string()))?;
+
+    // CR 107.3a + CR 601.2b + CR 702.179f: A `Pay X speed` mana-ability cost
+    // (Chicago Loop's `Pay X speed: Add X mana in any combination of colors`)
+    // requires the player to announce X before any cost is paid or mana is
+    // produced. X is bound to BOTH the speed cost and the produced-mana count.
+    if pending.chosen_x.is_none() {
+        if let Some(cost) = &ability_def.cost {
+            if pay_speed_x_cost(cost) {
+                // CR 118.3: a player can't pay a cost without the resources to
+                // pay it fully, so X is bounded by the player's current speed.
+                // CR 702.179f: a player with no speed has speed 0.
+                let max = super::speed::effective_speed(state, pending.player) as u32;
+                let source_id = pending.source_id;
+                let player = pending.player;
+                return Ok(WaitingFor::PayAmountChoice {
+                    player,
+                    resource: PayableResource::Speed,
+                    min: 0,
+                    max,
+                    accumulated: 0,
+                    source_id,
+                    pending_mana_ability: Some(Box::new(pending)),
+                });
+            }
+        }
+    }
 
     if pending.chosen_discards.is_empty() {
         if let Some((count, cards)) =
@@ -1179,6 +1284,36 @@ pub(super) fn advance_mana_ability_activation(
         }
     }
 
+    // CR 605.2 + CR 701.59: "Collect evidence N" in a (possibly composite)
+    // mana-ability cost (Cryptex) requires interactively exiling graveyard
+    // cards before any mana is produced. Surface the choice via the shared
+    // CollectEvidenceChoice prompt, resuming this activation once cards are
+    // chosen. Keyed on not-yet-collected (empty selection).
+    if pending.collected_evidence.is_empty() {
+        if let Some(cost) = &ability_def.cost {
+            if let Some(amount) = collect_evidence_cost_amount(cost) {
+                // CR 605.2 + CR 605.3b: pay the ability's cost before producing mana.
+                if !super::effects::collect_evidence::can_collect_evidence(
+                    state,
+                    pending.player,
+                    amount,
+                ) {
+                    return Err(EngineError::ActionNotAllowed(
+                        "Cannot pay collect-evidence cost for mana ability".to_string(),
+                    ));
+                }
+                return Ok(
+                    super::effects::collect_evidence::begin_cost_payment_for_mana_ability(
+                        state,
+                        pending.player,
+                        amount,
+                        pending,
+                    ),
+                );
+            }
+        }
+    }
+
     // CR 107.1c + CR 605.3a: "Remove any number of <type> counters" in a
     // mana-ability cost requires choosing the count before costs are paid and
     // mana is produced.
@@ -1247,6 +1382,7 @@ pub(super) fn advance_mana_ability_activation(
             pending.source_id,
             pending.player,
             &ability_def,
+            pending.chosen_x,
             pending.cost_paid_object.clone(),
         );
         if let Some(choice) = mana_choice_prompt(
@@ -1256,6 +1392,7 @@ pub(super) fn advance_mana_ability_activation(
             Some(&resolved_for_prompt),
         ) {
             let events_before = events.len();
+            let waiting_before_cost = state.waiting_for.clone();
             pay_mana_ability_cost_with_choices(
                 state,
                 pending.source_id,
@@ -1268,7 +1405,20 @@ pub(super) fn advance_mana_ability_activation(
                 &mut pending.chosen_sacrificed_battlefield.iter().copied(),
                 pending.chosen_mana_payment.as_deref(),
                 pending.chosen_counter_count,
+                pending.chosen_x,
+                // CR 605.3c: The interactive resume path is a fresh activation
+                // root, not a link in a suspended in-flight chain. Synchronous
+                // casting auto-tap recursion never crosses an interactive
+                // `WaitingFor` node: the instant a sub-cost needs a prompt the
+                // activation unwinds the Rust stack and serializes to
+                // `PendingManaAbility`. At resume there is therefore no ancestor
+                // activation on the call stack to exclude, so the chain is
+                // empty here.
+                &HashSet::new(),
             )?;
+            if state.waiting_for != waiting_before_cost {
+                return Ok(state.waiting_for.clone());
+            }
             // CR 603.2a + CR 603.2g + CR 605.3b: Cost-payment events (Tap,
             // Sacrifice, etc.) generated during a mana ability's cost step
             // trigger external abilities normally — CR 603.2a allows triggers
@@ -1306,6 +1456,7 @@ pub(super) fn advance_mana_ability_activation(
         }
     }
 
+    let waiting_before_cost = state.waiting_for.clone();
     resolve_mana_ability_with_selected_choices(
         state,
         pending.source_id,
@@ -1319,8 +1470,15 @@ pub(super) fn advance_mana_ability_activation(
         &pending.chosen_sacrificed_battlefield,
         pending.chosen_mana_payment.as_deref(),
         pending.chosen_counter_count,
+        pending.chosen_x,
         pending.cost_paid_object,
+        // CR 605.3c: Same as the interactive cost-payment site above — resume
+        // is a fresh activation root, the suspended-ancestor chain is empty.
+        &HashSet::new(),
     )?;
+    if state.waiting_for != waiting_before_cost {
+        return Ok(state.waiting_for.clone());
+    }
     complete_mana_ability_activation(
         state,
         pending.source_id,
@@ -1340,6 +1498,7 @@ fn pay_mana_ability_cost(
     player: PlayerId,
     cost: &Option<AbilityCost>,
     events: &mut Vec<GameEvent>,
+    excluded_sources: &HashSet<ObjectId>,
 ) -> Result<(), EngineError> {
     pay_mana_ability_cost_with_choices(
         state,
@@ -1353,6 +1512,8 @@ fn pay_mana_ability_cost(
         &mut std::iter::empty(),
         None,
         None,
+        None,
+        excluded_sources,
     )
 }
 
@@ -1370,7 +1531,9 @@ fn resolve_mana_ability_with_selected_choices(
     sacrificed_battlefield: &[ObjectId],
     chosen_hybrid_payment: Option<&[ManaType]>,
     chosen_counter_count: Option<u32>,
+    chosen_x: Option<u32>,
     cost_paid_object: Option<CostPaidObjectSnapshot>,
+    excluded_sources: &HashSet<ObjectId>,
 ) -> Result<(), EngineError> {
     let mut chosen = tapped_creatures.iter().copied();
     let mut discarded = discarded_cards.iter().copied();
@@ -1388,6 +1551,8 @@ fn resolve_mana_ability_with_selected_choices(
         &mut sacrificed,
         chosen_hybrid_payment,
         chosen_counter_count,
+        chosen_x,
+        excluded_sources,
     )?;
     if chosen.next().is_some() {
         return Err(EngineError::InvalidAction(
@@ -1418,6 +1583,7 @@ fn resolve_mana_ability_with_selected_choices(
         source_id,
         player,
         ability_def,
+        chosen_x,
         cost_paid_object,
     );
 
@@ -1598,6 +1764,8 @@ fn pay_mana_ability_cost_with_choices<I, J, K, L>(
     chosen_sacrificed_battlefield: &mut L,
     chosen_hybrid_payment: Option<&[ManaType]>,
     chosen_counter_count: Option<u32>,
+    chosen_x: Option<u32>,
+    excluded_sources: &HashSet<ObjectId>,
 ) -> Result<(), EngineError>
 where
     I: Iterator<Item = ObjectId>,
@@ -1617,6 +1785,7 @@ where
                 cost,
                 chosen_hybrid_payment,
                 events,
+                excluded_sources,
             )?;
         }
         // CR 605.1a + CR 701.17a: Bare `Mill` mana-ability cost. The Millikin
@@ -1962,6 +2131,7 @@ where
                             cost,
                             chosen_hybrid_payment,
                             events,
+                            excluded_sources,
                         )?;
                     }
                     // CR 605.1a + CR 701.17a: `Mill` sub-cost inside a Composite
@@ -1971,6 +2141,28 @@ where
                     // here alongside the tap.
                     AbilityCost::Mill { count } => {
                         mill_for_mana_cost(state, player, *count, events)?;
+                    }
+                    // CR 605.2 + CR 701.59: Collect-evidence sub-cost inside a
+                    // Composite mana-ability cost (Cryptex). The exile was
+                    // already performed interactively via the
+                    // `CollectEvidenceChoice` resume (see
+                    // `advance_mana_ability_activation`); no-op here so the cost
+                    // is neither re-paid nor errored.
+                    AbilityCost::CollectEvidence { .. } => {}
+                    // CR 107.3a/.3c + CR 702.179f: `Pay X speed` sub-cost
+                    // inside a Composite mana-ability cost. Concretize the
+                    // announced X into a Fixed cost, then delegate to the
+                    // single-authority cost payer.
+                    AbilityCost::PaySpeed { amount } => {
+                        let cost = match chosen_x {
+                            Some(x) => AbilityCost::PaySpeed {
+                                amount: QuantityExpr::Fixed { value: x as i32 },
+                            },
+                            None => AbilityCost::PaySpeed {
+                                amount: amount.clone(),
+                            },
+                        };
+                        super::costs::pay_ability_cost(state, player, source_id, &cost, events)?;
                     }
                     // Self-contained components (Untap {Q}, Exert, PayEnergy,
                     // self-ReturnToHand, EffectCost) delegate to the
@@ -1986,10 +2178,48 @@ where
                 }
             }
         }
+        // CR 605.2 + CR 701.59: Bare collect-evidence mana-ability cost. The
+        // exile already happened interactively via the `CollectEvidenceChoice`
+        // resume; no-op so the cost is neither re-paid nor errored.
+        Some(AbilityCost::CollectEvidence { .. }) => {}
+        // CR 107.3a/.3c + CR 702.179f: Bare `Pay X speed` mana-ability cost
+        // (Chicago Loop). Concretize the announced X into a Fixed cost, then
+        // delegate to the single-authority cost payer.
+        Some(AbilityCost::PaySpeed { amount }) => {
+            let cost = match chosen_x {
+                Some(x) => AbilityCost::PaySpeed {
+                    amount: QuantityExpr::Fixed { value: x as i32 },
+                },
+                None => AbilityCost::PaySpeed {
+                    amount: amount.clone(),
+                },
+            };
+            super::costs::pay_ability_cost(state, player, source_id, &cost, events)?;
+        }
         // Self-contained components (Untap, Exert, PayEnergy, self-ReturnToHand,
         // EffectCost) delegate to the single-authority cost payer.
         Some(c) if is_self_contained_mana_subcost(c) => {
             super::costs::pay_ability_cost(state, player, source_id, c, events)?;
+        }
+        // CR 122.1 + CR 601.2b: Standalone RemoveCounter-on-self mana-ability
+        // cost (Pentad Prism, Crystalline Crawler, Druids' Repository class).
+        // Mirrors the Composite sub-cost arm above.
+        Some(AbilityCost::RemoveCounter {
+            count,
+            counter_type,
+            target: None,
+            ..
+        }) => {
+            let count = match *count {
+                REMOVE_COUNTER_COST_ANY_NUMBER => chosen_counter_count.ok_or_else(|| {
+                    EngineError::InvalidAction("Missing counter count for mana ability".to_string())
+                })?,
+                REMOVE_COUNTER_COST_ALL => {
+                    removable_counter_count_for_mana_cost(state, source_id, counter_type)
+                }
+                count => count,
+            };
+            remove_counters_for_mana_cost(state, source_id, counter_type, count, events);
         }
         Some(other) => {
             return Err(EngineError::InvalidAction(format!(
@@ -2029,9 +2259,11 @@ fn mill_for_mana_cost(
             // bail like `mill::resolve` does so the surfaced prompt is not
             // clobbered. The parked activation resumes the remaining cost
             // components and mana production.
-            super::effects::mill::apply_mill_after_replacement(state, event, events).map_err(
+            if !super::effects::mill::apply_mill_after_replacement(state, event, events).map_err(
                 |e| EngineError::InvalidAction(format!("Mill cost could not be paid: {e:?}")),
-            )?;
+            )? {
+                return Ok(());
+            }
         }
         // CR 701.17b: "mill as many as you can" — a fully replaced-away or empty
         // library still pays the cost (milling zero cards is legal).
@@ -2057,18 +2289,32 @@ fn mill_for_mana_cost(
 /// `PaySpeed` is deliberately excluded: Chicago Loop's `Pay X speed: Add X mana`
 /// couples a player-announced X to both cost and effect (CR 601.2b), which the
 /// non-announcing delegation path cannot express — it is handled on its own.
+///
+/// `CollectEvidence` is also deliberately excluded: Cryptex's `Collect evidence 3`
+/// is paid interactively via the `CollectEvidenceChoice` prompt that
+/// `advance_mana_ability_activation` surfaces before mana production (CR 701.59),
+/// so it is a no-op in the cost-payment match rather than a delegated payment.
 fn is_self_contained_mana_subcost(cost: &AbilityCost) -> bool {
-    matches!(
-        cost,
+    match cost {
         AbilityCost::Untap
-            | AbilityCost::Exert
-            | AbilityCost::PayEnergy { .. }
-            | AbilityCost::EffectCost { .. }
-            | AbilityCost::ReturnToHand {
-                filter: Some(TargetFilter::SelfRef),
-                ..
-            }
-    )
+        | AbilityCost::Exert
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::ReturnToHand {
+            filter: Some(TargetFilter::SelfRef),
+            ..
+        } => true,
+        // CR 122.1 + CR 601.2b: Pentad Prism / Everflowing Chalice — bare
+        // self-RemoveCounter mana-ability costs (no tap) delegate to the
+        // activated-ability cost payer. "Remove any number" stays on the
+        // interactive mana-ability path in `advance_mana_ability_activation`.
+        AbilityCost::RemoveCounter {
+            target: None,
+            count,
+            ..
+        } => !crate::types::ability::is_chosen_remove_counter_cost_count(*count),
+        _ => false,
+    }
 }
 
 fn pay_life_cost(
@@ -2349,9 +2595,21 @@ fn pay_mana_sub_cost(
     cost: &ManaCost,
     hybrid_plan: Option<&[ManaType]>,
     events: &mut Vec<GameEvent>,
+    excluded_sources: &HashSet<ObjectId>,
 ) -> Result<(), EngineError> {
     if hybrid_plan.is_none() {
-        let excluded_sources = std::collections::HashSet::from([source_id]);
+        // CR 605.3c: Every source already in `excluded_sources` is an ancestor
+        // mana-ability activation that is synchronously suspended on the call
+        // stack mid-payment (its cost is still being paid; it has not yet
+        // resolved). CR 605.3c ("Once a player begins to activate a mana
+        // ability, that ability can't be activated again until it has
+        // resolved") applies to each ancestor link individually, so the entire
+        // in-flight chain must be excluded from auto-tap — not just `source_id`.
+        // Extending the chain here (rather than rebuilding it from
+        // `{source_id}`) is what makes a 2-source cross-payment, an N-source
+        // chain, or a self-loop terminate instead of recursing infinitely.
+        let mut excluded_sources = excluded_sources.clone();
+        excluded_sources.insert(source_id);
         // CR 605.1a: A mana ability never carries a power-up tag (power-up
         // abilities can't produce mana), so the tag-scoped activation context is
         // `None` here — Quinjet's {R}{R} must not pay another mana ability's cost.
@@ -5909,6 +6167,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -5971,6 +6231,8 @@ mod tests {
                 chosen_discards: Vec::new(),
                 chosen_mana_payment: None,
                 chosen_counter_count: None,
+                chosen_x: None,
+                collected_evidence: Vec::new(),
                 chosen_exiled: Vec::new(),
                 chosen_sacrificed_battlefield: Vec::new(),
                 cost_paid_object: None,
@@ -6199,6 +6461,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -6300,6 +6564,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -7199,6 +7465,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -7566,6 +7834,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8124,6 +8394,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8192,6 +8464,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8315,6 +8589,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8376,6 +8652,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8528,6 +8806,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -8631,5 +8911,140 @@ mod tests {
         assert_eq!(state.players[1].mana_pool.total(), 0);
         assert!(!state.objects.get(&forest).unwrap().tapped);
         assert!(events.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Standalone RemoveCounter mana ability (Pentad Prism class)
+    // ---------------------------------------------------------------
+
+    /// Pentad Prism: `Remove a charge counter from ~: Add one mana of any color.`
+    /// The cost is a bare `RemoveCounter` (NOT inside `Composite`).
+    fn make_pentad_prism(state: &mut GameState, player: PlayerId) -> ObjectId {
+        let prism = create_object(
+            state,
+            CardId(8100),
+            player,
+            "Pentad Prism".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&prism).unwrap();
+        obj.card_types
+            .core_types
+            .push(crate::types::card_type::CoreType::Artifact);
+        let charge_key = crate::types::counter::parse_counter_type("charge");
+        obj.counters.insert(charge_key, 2);
+
+        let ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    color_options: vec![
+                        ManaColor::White,
+                        ManaColor::Blue,
+                        ManaColor::Black,
+                        ManaColor::Red,
+                        ManaColor::Green,
+                    ],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: Vec::new(),
+                grants: Vec::new(),
+                expiry: None,
+                target: None,
+            },
+        )
+        .cost(AbilityCost::RemoveCounter {
+            count: 1,
+            counter_type: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+            target: None,
+            selection: crate::types::ability::CounterCostSelection::SingleObject,
+        });
+        Arc::make_mut(&mut obj.abilities).push(ability);
+        prism
+    }
+
+    #[test]
+    fn standalone_remove_counter_mana_ability_activates() {
+        use crate::types::counter::CounterType;
+
+        let mut state = GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let prism = make_pentad_prism(&mut state, player);
+
+        let def = state
+            .objects
+            .get(&prism)
+            .unwrap()
+            .abilities
+            .first()
+            .cloned()
+            .unwrap();
+
+        // Readiness must pass — the prism has charge counters.
+        assert!(
+            can_activate_mana_ability_now(&state, player, prism, 0, &def),
+            "Pentad Prism must be activatable with charge counters"
+        );
+
+        // Activate: produce blue mana.
+        let mut events = Vec::new();
+        resolve_mana_ability(
+            &mut state,
+            prism,
+            player,
+            &def,
+            &mut events,
+            Some(ProductionOverride::SingleColor(ManaType::Blue)),
+        )
+        .expect("Standalone RemoveCounter mana ability must not fail");
+
+        // One blue mana in pool.
+        assert_eq!(
+            state.players[player.0 as usize]
+                .mana_pool
+                .count_color(ManaType::Blue),
+            1,
+        );
+        // One charge counter removed (2 → 1).
+        let remaining = state
+            .objects
+            .get(&prism)
+            .unwrap()
+            .counters
+            .get(&CounterType::Generic("charge".to_string()))
+            .copied()
+            .unwrap_or(0);
+        assert_eq!(remaining, 1);
+        // Source is NOT tapped (no tap cost).
+        assert!(
+            !state.objects.get(&prism).unwrap().tapped,
+            "Pentad Prism must not be tapped — cost is only RemoveCounter"
+        );
+    }
+
+    #[test]
+    fn standalone_remove_counter_mana_ability_unpayable_without_counters() {
+        let mut state = GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let prism = make_pentad_prism(&mut state, player);
+
+        // Remove all charge counters.
+        state.objects.get_mut(&prism).unwrap().counters.clear();
+
+        let def = state
+            .objects
+            .get(&prism)
+            .unwrap()
+            .abilities
+            .first()
+            .cloned()
+            .unwrap();
+
+        // Readiness must fail — no counters to remove.
+        assert!(
+            !can_activate_mana_ability_now(&state, player, prism, 0, &def),
+            "Pentad Prism must not be activatable without charge counters"
+        );
     }
 }
