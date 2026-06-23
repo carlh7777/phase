@@ -1,4 +1,5 @@
 import { AnimatePresence, motion } from "framer-motion";
+import { useEffect } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
@@ -11,6 +12,10 @@ interface ConfirmDialogProps {
   onCancel: () => void;
   /** Visual emphasis for the confirm action. */
   tone?: "danger" | "primary";
+  /** Optional second confirm action (e.g. import merge vs overwrite). */
+  secondaryConfirmLabel?: string;
+  onSecondaryConfirm?: () => void;
+  secondaryTone?: "danger" | "primary";
 }
 
 const CONFIRM_TONE_CLASS = {
@@ -32,8 +37,24 @@ export function ConfirmDialog({
   onConfirm,
   onCancel,
   tone = "danger",
+  secondaryConfirmLabel,
+  onSecondaryConfirm,
+  secondaryTone = "primary",
 }: ConfirmDialogProps) {
   const { t } = useTranslation();
+
+  useEffect(() => {
+    if (!open) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onCancel();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [open, onCancel]);
 
   return createPortal(
     <AnimatePresence>
@@ -77,14 +98,24 @@ export function ConfirmDialog({
             >
               {message}
             </p>
-            <div className="mt-6 flex justify-end gap-3">
+            <div className="mt-6 flex flex-wrap justify-end gap-3">
               <button
                 type="button"
+                autoFocus
                 onClick={onCancel}
                 className="rounded-[14px] border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10"
               >
                 {t("actions.cancel")}
               </button>
+              {secondaryConfirmLabel && onSecondaryConfirm ? (
+                <button
+                  type="button"
+                  onClick={onSecondaryConfirm}
+                  className={`rounded-[14px] border px-4 py-2 text-sm font-medium transition ${CONFIRM_TONE_CLASS[secondaryTone]}`}
+                >
+                  {secondaryConfirmLabel}
+                </button>
+              ) : null}
               <button
                 type="button"
                 onClick={onConfirm}
