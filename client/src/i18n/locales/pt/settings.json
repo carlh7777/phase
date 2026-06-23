@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Redefinir todas as preferências para os padrões? Isso limpa todas as configurações deste diálogo.",
-    "button": "Redefinir todas as preferências"
+    "button": "Redefinir todas as preferências",
+    "confirmAction": "Redefinir"
   },
   "pacing": {
     "title": "Ritmo",

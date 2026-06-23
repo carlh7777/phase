@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Réinitialiser toutes les préférences aux valeurs par défaut ? Cela efface tous les paramètres de cette boîte de dialogue.",
-    "button": "Réinitialiser toutes les préférences"
+    "button": "Réinitialiser toutes les préférences",
+    "confirmAction": "Réinitialiser"
   },
   "pacing": {
     "title": "Rythme",

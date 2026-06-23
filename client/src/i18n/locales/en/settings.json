@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Reset all preferences to defaults? This clears every setting in this dialog.",
-    "button": "Reset all preferences"
+    "button": "Reset all preferences",
+    "confirmAction": "Reset"
   },
   "pacing": {
     "title": "Pacing",

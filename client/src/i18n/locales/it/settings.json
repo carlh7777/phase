@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Reimpostare tutte le preferenze ai valori predefiniti? Questo cancella ogni impostazione in questa finestra.",
-    "button": "Reimposta tutte le preferenze"
+    "button": "Reimposta tutte le preferenze",
+    "confirmAction": "Reimposta"
   },
   "pacing": {
     "title": "Ritmo",

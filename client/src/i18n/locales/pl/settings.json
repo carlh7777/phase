@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Zresetować wszystkie preferencje do wartości domyślnych? Spowoduje to wyczyszczenie każdego ustawienia w tym oknie.",
-    "button": "Zresetuj wszystkie preferencje"
+    "button": "Zresetuj wszystkie preferencje",
+    "confirmAction": "Zresetuj"
   },
   "pacing": {
     "title": "Tempo",

@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "¿Restablecer todas las preferencias a sus valores predeterminados? Esto borra todos los ajustes de este diálogo.",
-    "button": "Restablecer todas las preferencias"
+    "button": "Restablecer todas las preferencias",
+    "confirmAction": "Restablecer"
   },
   "pacing": {
     "title": "Ritmo",

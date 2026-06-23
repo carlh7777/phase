@@ -38,6 +38,7 @@ import type { SupportedLng } from "../../i18n/resources.ts";
 import { LanguageFlag } from "../ui/LanguageFlag.tsx";
 import { BATTLEFIELDS } from "../board/battlefields.ts";
 import { PLAIN_BACKGROUNDS } from "../board/plainBackgrounds.ts";
+import { ConfirmDialog } from "../ui/ConfirmDialog.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell";
 import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
@@ -706,20 +707,32 @@ function ResetAllFooter({
   resetAllPreferences: () => void;
 }) {
   const { t } = useTranslation("settings");
-  const onClick = useCallback(() => {
-    if (window.confirm(t("resetAll.confirm"))) {
-      resetAllPreferences();
-    }
-  }, [resetAllPreferences, t]);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+
+  const onConfirm = useCallback(() => {
+    resetAllPreferences();
+    setConfirmOpen(false);
+  }, [resetAllPreferences]);
 
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500 transition-colors hover:text-rose-300"
-    >
-      {t("resetAll.button")}
-    </button>
+    <>
+      <button
+        type="button"
+        onClick={() => setConfirmOpen(true)}
+        className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500 transition-colors hover:text-rose-300"
+      >
+        {t("resetAll.button")}
+      </button>
+      <ConfirmDialog
+        open={confirmOpen}
+        title={t("resetAll.button")}
+        message={t("resetAll.confirm")}
+        confirmLabel={t("resetAll.confirmAction")}
+        onConfirm={onConfirm}
+        onCancel={() => setConfirmOpen(false)}
+        tone="danger"
+      />
+    </>
   );
 }
 

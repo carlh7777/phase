@@ -171,7 +171,8 @@
   },
   "resetAll": {
     "confirm": "Alle Einstellungen auf die Standardwerte zurücksetzen? Dies löscht jede Einstellung in diesem Dialog.",
-    "button": "Alle Einstellungen zurücksetzen"
+    "button": "Alle Einstellungen zurücksetzen",
+    "confirmAction": "Zurücksetzen"
   },
   "pacing": {
     "title": "Tempo",
