@@ -28,13 +28,14 @@ describe("PeekRestoreTab mobile (direction=bottom)", () => {
     cleanup();
   });
 
-  it("anchors the restore cue to the right edge below mid-screen", () => {
+  it("anchors the restore cue to the left edge below mid-screen", () => {
     render(<PeekRestoreTab direction="bottom" onClick={() => {}} />);
     const button = screen.getByLabelText("Restore dialog");
-    expect(button.className).toMatch(/right-3/);
-    expect(button.className).toMatch(/top-\[62%\]/);
-    expect(button.className).toMatch(/h-16/);
-    expect(button.className).not.toMatch(/left-3/);
+    expect(button.className).toMatch(/left-3/);
+    expect(button.className).toMatch(/top-\[63%\]/);
+    expect(button.className).toMatch(/h-9/);
+    expect(button.className).toMatch(/w-9/);
+    expect(button.className).not.toMatch(/right-3/);
     expect(button.className).not.toMatch(/left-1\/2/);
     expect(button.className).not.toMatch(/bottom-3/);
   });
