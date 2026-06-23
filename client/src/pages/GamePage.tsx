@@ -1278,9 +1278,11 @@ function GamePageContent({
           style={{ height: "min(calc(0.18 * (100dvh - var(--game-top-overlay-offset, 0px))), 150px)" }}
           data-flex-zone="player-row"
         >
-          <div className="flex items-end justify-center">
+          <div className="flex items-end justify-center" data-flex-zone="playerHandRow">
             {/* Castable graveyard/exile cards now render as colored wings inside
-                PlayerHand's own fan (see ZoneFanCard), so the row is just the hand. */}
+                PlayerHand's own fan (see ZoneFanCard), so the row is just the hand.
+                The `playerHandRow` flex-zone hook drives the mobile hand-lift
+                transform in index.css. */}
             <PlayerHand />
           </div>
           <DraggableWidget
