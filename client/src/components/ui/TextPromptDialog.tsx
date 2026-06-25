@@ -33,7 +33,7 @@ export function TextPromptDialog({
   onConfirm,
   onCancel,
 }: TextPromptDialogProps) {
-  const { t } = useTranslation();
+  const { t } = useTranslation("common");
   const titleId = useId();
   const labelId = useId();
   const inputRef = useRef<HTMLInputElement>(null);
