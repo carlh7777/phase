@@ -31,6 +31,7 @@ import {
 } from "../../services/feedPersistence";
 import { FeedManagerModal } from "./FeedManagerModal";
 import { ConfirmDialog } from "../ui/ConfirmDialog";
+import { TextPromptDialog } from "../ui/TextPromptDialog";
 import { ManaSymbol } from "../mana/ManaSymbol";
 import { useCardImage } from "../../hooks/useCardImage";
 import {
