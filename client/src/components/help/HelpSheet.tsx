@@ -6,10 +6,11 @@ import type { TFunction } from "i18next";
 import type { GameAction, GameState, WaitingFor } from "../../adapter/types.ts";
 import {
   copyGameStateDebugSnapshot,
-  exportGameStateDebugZip,
+  exportAuthoritativeGameStateZip,
 } from "../../services/gameStateExport.ts";
+import { downloadCurrentReplay } from "../../services/replayExport.ts";
 import { useCanActForWaitingState, usePlayerId } from "../../hooks/usePlayerId.ts";
-import { useGameStore } from "../../stores/gameStore.ts";
+import { canExportAuthoritativeState, useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 
 type HelpSection = "Flow" | "Shortcuts" | "Recovery";
@@ -71,15 +72,18 @@ function currentPromptSummary({
   if (waitingFor.type === "GameOver") return t("help.prompt.gameOver");
 
   if (waitingFor.type === "MulliganDecision") {
-    return waitingFor.data.pending.some((entry) => entry.player === playerId)
-      ? t("help.prompt.mulliganDecide")
+    const entry = waitingFor.data.pending.find((e) => e.player === playerId);
+    if (entry) {
+      return entry.phase.type === "BottomCards"
+        ? t("help.prompt.mulliganBottom")
+        : t("help.prompt.mulliganDecide");
+    }
+    const someoneBottoming = waitingFor.data.pending.some(
+      (e) => e.phase.type === "BottomCards",
+    );
+    return someoneBottoming
+      ? t("help.prompt.mulliganWaitBottom")
       : t("help.prompt.mulliganWaitDecide");
-  }
-
-  if (waitingFor.type === "MulliganBottomCards") {
-    return waitingFor.data.pending.some((entry) => entry.player === playerId)
-      ? t("help.prompt.mulliganBottom")
-      : t("help.prompt.mulliganWaitBottom");
   }
 
   if (waitingFor.type === "OpeningHandBottomCards") {
@@ -137,6 +141,8 @@ export function HelpSheet() {
   const setOpen = useUiStore((s) => s.setHelpSheetOpen);
   const toggleDebugPanel = useUiStore((s) => s.toggleDebugPanel);
   const gameState = useGameStore((s) => s.gameState);
+  const gameMode = useGameStore((s) => s.gameMode);
+  const adapter = useGameStore((s) => s.adapter);
   const waitingFor = useGameStore((s) => s.waitingFor);
   const legalActions = useGameStore((s) => s.legalActions);
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
@@ -149,6 +155,8 @@ export function HelpSheet() {
   const searchRef = useRef<HTMLInputElement | null>(null);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const titleId = useId();
+  const canExportAuthoritative = canExportAuthoritativeState(gameMode)
+    && adapter?.exportPersistenceState !== undefined;
 
   useEffect(() => {
     if (!open) return;
@@ -232,12 +240,27 @@ export function HelpSheet() {
   };
 
   const handleExportState = () => {
-    if (!gameState) return;
-    exportGameStateDebugZip(gameState)
+    if (!canExportAuthoritative || !adapter?.exportPersistenceState) return;
+    exportAuthoritativeGameStateZip(adapter)
       .then((filename) => setStatus(t("help.status.exported", { filename })))
       .catch((err: unknown) => {
         if (err instanceof DOMException && err.name === "AbortError") return;
         setStatus(t("help.status.exportFailed"));
+      });
+  };
+
+  const handleExportReplay = () => {
+    downloadCurrentReplay()
+      .then((filename) => {
+        setStatus(
+          filename
+            ? t("help.status.replayExported", { filename })
+            : t("help.status.replayExportUnavailable"),
+        );
+      })
+      .catch((err: unknown) => {
+        if (err instanceof DOMException && err.name === "AbortError") return;
+        setStatus(t("help.status.replayExportFailed"));
       });
   };
 
@@ -350,11 +373,19 @@ export function HelpSheet() {
                   </button>
                   <button
                     type="button"
-                    disabled={!gameState}
+                    disabled={!gameState || !canExportAuthoritative}
                     onClick={handleExportState}
                     className="rounded-lg border border-white/10 bg-white/8 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
                   >
                     {t("help.exportState")}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!gameState}
+                    onClick={handleExportReplay}
+                    className="rounded-lg border border-white/10 bg-white/8 px-3 py-2 text-sm font-semibold text-slate-100 transition hover:bg-white/12 disabled:cursor-not-allowed disabled:opacity-40"
+                  >
+                    {t("help.exportReplay")}
                   </button>
                   <button
                     type="button"

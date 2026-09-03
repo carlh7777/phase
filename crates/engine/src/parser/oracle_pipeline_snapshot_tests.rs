@@ -65,6 +65,7 @@ fn pipeline_chandra_plus_one_exile_cast_typed_single_use() {
                         card_filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
                         single_use: true,
                         cast_cost_raise: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         ..
                     },
@@ -107,6 +108,7 @@ fn pipeline_plural_exile_cast_stays_unrestricted() {
                     card_filter: None,
                     single_use: false,
                     cast_cost_raise: None,
+                    alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     ..
                 },
@@ -544,7 +546,8 @@ fn zack_fair_activated_parses_counter_move_and_attach_sub_chain() {
 
     let effect = "Target creature you control gains indestructible until end of turn. Put Zack Fair's counters on that creature and attach an Equipment that was attached to Zack Fair to that creature.";
     let mut ctx = ParseContext::default();
-    let def = parse_activated_with_self_ref_fallback(effect, "Zack Fair", &mut ctx);
+    let ir = parse_activated_ability_ir_with_self_ref_fallback(effect, "Zack Fair", &mut ctx);
+    let def = lower_ability_ir(&ir);
 
     fn has_effect(def: &AbilityDefinition, pred: &dyn Fn(&Effect) -> bool) -> bool {
         if pred(&def.effect) {

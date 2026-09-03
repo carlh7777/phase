@@ -1,20 +1,25 @@
 import type {
   EngineAdapter,
+  EngineSnapshot,
   GameAction,
   GameEvent,
   GameLogEntry,
   GameState,
   LegalActionsResult,
   ManaCost,
+  ObjectAction,
+  ObjectId,
   PlayerId,
   SubmitResult,
 } from "./types";
-import { AdapterError, AdapterErrorCode } from "./types";
+import type { InteractionSubmission } from "./generated/interaction";
+import { actionRejectionError, AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, isActionRejection, nextSnapshotSeq } from "./types";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import {
   HandshakeError,
   openPhaseSocket,
   type PhaseSocket,
+  type PhaseSocketTransport,
 } from "../services/openPhaseSocket";
 import { isValidWebSocketUrl } from "../services/serverDetection";
 import type {
@@ -22,6 +27,7 @@ import type {
   StandingEntry,
   TournamentFormat,
   PodPolicy,
+  DraftKind,
 } from "./draft-adapter";
 import type { ServerInfo } from "./ws-adapter";
 
@@ -35,17 +41,42 @@ export type DraftPhase =
   | "between_rounds"
   | "complete";
 
+/**
+ * Client intent for a server-hosted set draft. This is intentionally not the
+ * persisted engine `DraftSource`: a Chaos request names candidate sets only,
+ * and the native server privately resolves its per-seat pack assignments.
+ */
+export type DraftSourceIntent =
+  | { type: "Uniform"; data: { set_codes: string[] } }
+  | { type: "Chaos"; data: { candidate_codes: string[] } };
+
 /** Settings for creating a new server-hosted draft pod. */
 export interface CreateDraftSettings {
   displayName: string;
-  setCode: string;
-  kind: "Premier" | "Traditional";
+  /**
+   * The set filling each booster, in pack order. One entry per pack the pod
+   * opens; the same set may fill several, and a one-element list fills every
+   * booster (the server repeats the last entry). Mirrors the wire field
+   * Legacy UI input for a Uniform source. New callers may pass `source`
+   * directly; the adapter always serializes the tagged source boundary.
+   */
+  setCodes?: string[];
+  /** Canonical server source intent. Never contains Chaos assignments. */
+  source?: DraftSourceIntent;
+  kind: Exclude<DraftKind, "Quick">;
   public: boolean;
   password?: string;
   timerSeconds?: number;
   tournamentFormat: TournamentFormat;
   podPolicy: PodPolicy;
   podSize: number;
+}
+
+function draftSourceIntent(settings: CreateDraftSettings): DraftSourceIntent {
+  return settings.source ?? {
+    type: "Uniform",
+    data: { set_codes: settings.setCodes ?? [] },
+  };
 }
 
 /** Events emitted by ServerDraftAdapter for UI state updates. */
@@ -57,7 +88,7 @@ export type ServerDraftAdapterEvent =
   | { type: "timerSync"; remainingMs: number }
   | { type: "draftOver"; standings: StandingEntry[] }
   | { type: "draftActionRejected"; reason: string }
-  | { type: "gameStateUpdated"; state: GameState; events: GameEvent[]; legalResult: LegalActionsResult }
+  | { type: "gameStateUpdated"; state: GameState; events: GameEvent[]; legalResult: LegalActionsResult; logEntries?: GameLogEntry[] }
   | { type: "gameOver"; winner: PlayerId | null; reason: string }
   | { type: "actionPendingChanged"; pending: boolean }
   | { type: "disconnected" }
@@ -92,16 +123,25 @@ export class ServerDraftAdapter implements EngineAdapter {
   private draftView: DraftPlayerView | null = null;
 
   // ── Game-phase state ───────────────────────────────────────────────
-  private gameState: GameState | null = null;
+  /**
+   * The single cached engine pair, rebuilt (and re-stamped) once per inbound
+   * state-bearing message — same pattern as the P2P guest / ws adapters, so
+   * `getState`/`getLegalActions` can never straddle two updates.
+   */
+  private snapshot: EngineSnapshot | null = null;
   private _playerId: PlayerId | null = null;
-  private _legalActions: LegalActionsResult = { actions: [], autoPassRecommended: false };
   private activeMatchId: string | null = null;
   private _gameCode: string | null = null;
 
   // ── Infrastructure ─────────────────────────────────────────────────
-  private ws: WebSocket | null = null;
+  private ws: PhaseSocketTransport | null = null;
   private pendingResolve: ((result: SubmitResult) => void) | null = null;
   private pendingReject: ((error: Error) => void) | null = null;
+  private nextManaPaymentPreviewRequestId = 1;
+  private pendingManaPaymentPreviews = new Map<
+    number,
+    { resolve: (sourceIds: ObjectId[]) => void; reject: (error: Error) => void }
+  >();
   private draftResolve: ((view: DraftPlayerView) => void) | null = null;
   private draftReject: ((error: Error) => void) | null = null;
   private initResolve: (() => void) | null = null;
@@ -187,19 +227,71 @@ export class ServerDraftAdapter implements EngineAdapter {
     });
   }
 
-  async getState(): Promise<GameState> {
-    if (!this.gameState) {
-      throw new AdapterError("WS_ERROR", "No game state available", false);
+  async submitInteraction(
+    submission: InteractionSubmission,
+    _actor: PlayerId,
+  ): Promise<SubmitResult> {
+    if (this.phase !== "match") {
+      throw new AdapterError("PHASE_ERROR", "Not in a match phase", false);
     }
-    return this.gameState;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+    }
+
+    this.emit({ type: "actionPendingChanged", pending: true });
+    return new Promise<SubmitResult>((resolve, reject) => {
+      this.pendingResolve = resolve;
+      this.pendingReject = reject;
+      if (!this.send({ type: "Interaction", data: { submission } })) {
+        this.pendingResolve = null;
+        this.pendingReject = null;
+        this.emit({ type: "actionPendingChanged", pending: false });
+        reject(new AdapterError("WS_CLOSED", "Failed to send interaction", true));
+      }
+    });
   }
 
-  getAiAction(): GameAction | null {
-    return null;
+  async previewManaPayment(action: GameAction, _actor: PlayerId): Promise<ObjectId[]> {
+    if (this.phase !== "match") {
+      throw new AdapterError("PHASE_ERROR", "Not in a match phase", false);
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+    }
+
+    const requestId = this.nextManaPaymentPreviewRequestId++;
+    return new Promise<ObjectId[]>((resolve, reject) => {
+      this.pendingManaPaymentPreviews.set(requestId, { resolve, reject });
+      if (!this.send({ type: "PreviewManaPayment", data: { request_id: requestId, action } })) {
+        this.pendingManaPaymentPreviews.delete(requestId);
+        reject(new AdapterError("WS_CLOSED", "Failed to send mana-payment preview", true));
+      }
+    });
+  }
+
+  async getState(): Promise<GameState> {
+    if (!this.snapshot) {
+      throw new AdapterError("WS_ERROR", "No game state available", false);
+    }
+    return this.snapshot.state;
   }
 
   async getLegalActions(): Promise<LegalActionsResult> {
-    return this._legalActions;
+    return this.snapshot?.legalResult ?? EMPTY_LEGAL_ACTIONS;
+  }
+
+  async getSnapshot(): Promise<EngineSnapshot> {
+    if (!this.snapshot) {
+      throw new AdapterError("WS_ERROR", "No game state available", false);
+    }
+    return this.snapshot;
+  }
+
+  /** Rebuild the cached pair from an inbound state-bearing message, stamping
+   *  it with a fresh globally-monotonic seq at arrival. */
+  private cacheSnapshot(state: GameState, legalResult: LegalActionsResult): EngineSnapshot {
+    this.snapshot = { state, legalResult, seq: nextSnapshotSeq() };
+    return this.snapshot;
   }
 
   restoreState(): void {
@@ -232,7 +324,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         type: "CreateDraftWithSettings",
         data: {
           display_name: settings.displayName,
-          set_code: settings.setCode,
+          source: draftSourceIntent(settings),
           kind: settings.kind,
           public: settings.public,
           password: settings.password ?? null,
@@ -289,7 +381,7 @@ export class ServerDraftAdapter implements EngineAdapter {
           draft_code: this.draftCode,
           action: {
             type: "Pick",
-            data: { seat: this.seatIndex, card_instance_id: cardInstanceId },
+            data: { seat: this.seatIndex, card_instance_ids: [cardInstanceId] },
           },
         },
       });
@@ -301,7 +393,7 @@ export class ServerDraftAdapter implements EngineAdapter {
     });
   }
 
-  async submitDeck(mainDeck: string[]): Promise<DraftPlayerView> {
+  async submitDeck(mainDeck: string[], commanders: string[]): Promise<DraftPlayerView> {
     if (this.seatIndex === null || this.draftCode === null) {
       throw new AdapterError("PHASE_ERROR", "Not in a draft session", false);
     }
@@ -314,7 +406,11 @@ export class ServerDraftAdapter implements EngineAdapter {
           draft_code: this.draftCode,
           action: {
             type: "SubmitDeck",
-            data: { seat: this.seatIndex, main_deck: mainDeck },
+            // Key order mirrors the Rust struct's field order (`seat`,
+            // `main_deck`, `commanders`). `private send(msg: unknown)` means
+            // no typechecker sees this payload, so the byte-exact
+            // `JSON.stringify` assertion in the suite is what pins it.
+            data: { seat: this.seatIndex, main_deck: mainDeck, commanders },
           },
         },
       });
@@ -411,6 +507,9 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.pendingResolve = null;
         this.pendingReject = null;
       }
+      this.rejectPendingManaPaymentPreviews(
+        new AdapterError("WS_CLOSED", "Connection closed during mana-payment preview", true),
+      );
       if (this.draftReject) {
         this.draftReject(
           new AdapterError("WS_CLOSED", "Connection closed during draft operation", true),
@@ -557,23 +656,31 @@ export class ServerDraftAdapter implements EngineAdapter {
           your_player: PlayerId;
           legal_actions?: GameAction[];
           auto_pass_recommended?: boolean;
+          end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"];
+          mana_payment_shortcut_actions?: GameAction[];
           spell_costs?: Record<string, ManaCost>;
-          legal_actions_by_object?: Record<string, GameAction[]>;
+          legal_actions_by_object?: Record<string, ObjectAction[]>;
+          viewer_interaction?: LegalActionsResult["viewerInteraction"];
           derived?: GameState["derived"];
         };
-        this.gameState = { ...data.state, derived: data.derived ?? data.state.derived };
+        const startedSnapshot = this.cacheSnapshot(
+          { ...data.state, derived: data.derived ?? data.state.derived },
+          {
+            actions: data.legal_actions ?? [],
+            autoPassRecommended: data.auto_pass_recommended ?? false,
+            endContinuousEffectOffers: data.end_continuous_effect_offers ?? [],
+            manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
+            spellCosts: data.spell_costs,
+            legalActionsByObject: data.legal_actions_by_object,
+            viewerInteraction: data.viewer_interaction,
+          },
+        );
         this._playerId = data.your_player;
-        this._legalActions = {
-          actions: data.legal_actions ?? [],
-          autoPassRecommended: data.auto_pass_recommended ?? false,
-          spellCosts: data.spell_costs,
-          legalActionsByObject: data.legal_actions_by_object,
-        };
         this.emit({
           type: "gameStateUpdated",
-          state: this.gameState,
+          state: startedSnapshot.state,
           events: [],
-          legalResult: this._legalActions,
+          legalResult: startedSnapshot.legalResult,
         });
         break;
       }
@@ -584,18 +691,26 @@ export class ServerDraftAdapter implements EngineAdapter {
           events: GameEvent[];
           legal_actions?: GameAction[];
           auto_pass_recommended?: boolean;
+          end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"];
+          mana_payment_shortcut_actions?: GameAction[];
           spell_costs?: Record<string, ManaCost>;
-          legal_actions_by_object?: Record<string, GameAction[]>;
+          legal_actions_by_object?: Record<string, ObjectAction[]>;
+          viewer_interaction?: LegalActionsResult["viewerInteraction"];
           log_entries?: GameLogEntry[];
           derived?: GameState["derived"];
         };
-        this.gameState = { ...data.state, derived: data.derived ?? data.state.derived };
-        this._legalActions = {
-          actions: data.legal_actions ?? [],
-          autoPassRecommended: data.auto_pass_recommended ?? false,
-          spellCosts: data.spell_costs,
-          legalActionsByObject: data.legal_actions_by_object,
-        };
+        const updateSnapshot = this.cacheSnapshot(
+          { ...data.state, derived: data.derived ?? data.state.derived },
+          {
+            actions: data.legal_actions ?? [],
+            autoPassRecommended: data.auto_pass_recommended ?? false,
+            endContinuousEffectOffers: data.end_continuous_effect_offers ?? [],
+            manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
+            spellCosts: data.spell_costs,
+            legalActionsByObject: data.legal_actions_by_object,
+            viewerInteraction: data.viewer_interaction,
+          },
+        );
         if (this.pendingResolve) {
           this.emit({ type: "actionPendingChanged", pending: false });
           this.pendingResolve({ events: data.events, log_entries: data.log_entries });
@@ -604,23 +719,91 @@ export class ServerDraftAdapter implements EngineAdapter {
         } else {
           this.emit({
             type: "gameStateUpdated",
-            state: this.gameState,
+            state: updateSnapshot.state,
             events: data.events,
-            legalResult: this._legalActions,
+            legalResult: updateSnapshot.legalResult,
+            logEntries: data.log_entries,
           });
         }
         break;
       }
 
       case "ActionRejected": {
-        const data = msg.data as { reason: string };
+        const data = msg.data as { rejection?: unknown };
         this.emit({ type: "actionPendingChanged", pending: false });
         if (this.pendingReject) {
+          // Game-phase action rejection. `ServerDraftAdapter` is a full
+          // `EngineAdapter` once the pod's game starts, so it must classify the
+          // engine's stale verdicts exactly as the WebSocket and P2P transports
+          // do — otherwise a stale `ReorderHand` in a server-hosted draft game
+          // still surfaces as the red recoverable error this PR removes
+          // everywhere else.
+          //
+          // The mana-payment preview handler below routes through the same
+          // classifier. Deliberately NOT applied to `DraftActionRejected`: that
+          // carries a pick/pass rejection, which is not a `GameAction` at all,
+          // so no stale-action verdict is possible — it is a separate draft
+          // protocol concern and stays a plain recoverable rejection.
           this.pendingReject(
-            new AdapterError("ACTION_REJECTED", data.reason, true),
+            isActionRejection(data.rejection)
+              ? actionRejectionError(data.rejection)
+              : new AdapterError(AdapterErrorCode.WASM_ERROR, "Server sent an invalid action rejection.", false),
           );
           this.pendingResolve = null;
           this.pendingReject = null;
+        }
+        break;
+      }
+
+      case "ActionFailed": {
+        const data = msg.data as { message: string };
+        if (this.pendingReject) {
+          this.emit({ type: "actionPendingChanged", pending: false });
+          this.pendingReject(new AdapterError("WS_ERROR", data.message, false));
+          this.pendingResolve = null;
+          this.pendingReject = null;
+        } else {
+          this.emit({ type: "error", message: data.message });
+        }
+        break;
+      }
+
+      case "ManaPaymentPreview": {
+        const data = msg.data as { request_id: number; source_ids: ObjectId[] };
+        const pending = this.pendingManaPaymentPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingManaPaymentPreviews.delete(data.request_id);
+          pending.resolve(data.source_ids);
+        }
+        break;
+      }
+
+      case "ManaPaymentPreviewRejected": {
+        const data = msg.data as { request_id: number; rejection?: unknown };
+        const pending = this.pendingManaPaymentPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingManaPaymentPreviews.delete(data.request_id);
+          // Same shared classifier as the action path above. A preview is
+          // answered against the same engine state an action would be, so it
+          // can carry the same stale verdict when the state moves underneath
+          // the request — and a stale preview is likewise void rather than
+          // retryable. Non-stale reasons still classify as recoverable
+          // ACTION_REJECTED, so existing surface/retry behavior is unchanged.
+          pending.reject(
+            isActionRejection(data.rejection)
+              ? actionRejectionError(data.rejection)
+              : new AdapterError(AdapterErrorCode.WASM_ERROR, "Server sent an invalid mana-payment rejection.", false),
+          );
+        }
+        break;
+      }
+
+      case "ManaPaymentPreviewFailed": {
+        const data = msg.data as { request_id: number; message: string };
+        const pending = this.pendingManaPaymentPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingManaPaymentPreviews.delete(data.request_id);
+          pending.reject(new AdapterError("WS_ERROR", data.message, false));
         }
         break;
       }
@@ -632,7 +815,7 @@ export class ServerDraftAdapter implements EngineAdapter {
         this.phase = "between_rounds";
         this.activeMatchId = null;
         this._gameCode = null;
-        this.gameState = null;
+        this.snapshot = null;
         this.emit({ type: "actionPendingChanged", pending: false });
         this.emit({
           type: "gameOver",
@@ -746,6 +929,13 @@ export class ServerDraftAdapter implements EngineAdapter {
     }
   }
 
+  private rejectPendingManaPaymentPreviews(error: Error): void {
+    for (const { reject } of this.pendingManaPaymentPreviews.values()) {
+      reject(error);
+    }
+    this.pendingManaPaymentPreviews.clear();
+  }
+
   dispose(): void {
     this.disposed = true;
     if (this.pingInterval) {
@@ -756,7 +946,7 @@ export class ServerDraftAdapter implements EngineAdapter {
       this.ws.close();
       this.ws = null;
     }
-    this.gameState = null;
+    this.snapshot = null;
     this._playerId = null;
     this._gameCode = null;
     this.draftCode = null;
@@ -766,6 +956,9 @@ export class ServerDraftAdapter implements EngineAdapter {
     this.activeMatchId = null;
     this.pendingResolve = null;
     this.pendingReject = null;
+    this.rejectPendingManaPaymentPreviews(
+      new AdapterError("WS_CLOSED", "Adapter disposed during mana-payment preview", true),
+    );
     this.draftResolve = null;
     this.draftReject = null;
     this.initResolve = null;

@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import { Trans, useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 
@@ -32,7 +39,9 @@ import type {
   CardPreviewMode,
   CardSizePreference,
   CommandZoneDisplay,
-  LogDefaultState,
+  DraftCardPreviewMode,
+  MultiplayerBoardLayout,
+  SpellPaymentMode,
   ZoneCollapseMode,
 } from "../../stores/preferencesStore.ts";
 import type { SupportedLng } from "../../i18n/resources.ts";
@@ -43,8 +52,11 @@ import { ConfirmDialog } from "../ui/ConfirmDialog.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell";
 import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
+import { isDesktopTauri } from "../../services/platform.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
+import { useSetCatalog } from "../../hooks/useSetSymbols.ts";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
+import { VisualPackManager } from "./visual-packs/VisualPackManager.tsx";
 
 export type SettingsHighlight = "board-background";
 
@@ -52,6 +64,7 @@ interface PreferencesModalProps {
   onClose: () => void;
   initialTab?: SettingsTabId;
   highlight?: SettingsHighlight;
+  returnFocusRef?: RefObject<HTMLElement | SVGElement | null>;
 }
 
 /** Locale options for the language selector. Labels are autonyms (each language's
@@ -70,8 +83,11 @@ const CARD_SIZES: CardSizePreference[] = ["small", "medium", "large"];
 const COMMAND_ZONE_DISPLAYS: CommandZoneDisplay[] = ["auto", "inline", "compact"];
 const ZONE_COLLAPSE_MODES: ZoneCollapseMode[] = ["auto", "on", "off"];
 const CARD_PREVIEW_MODES: CardPreviewMode[] = ["follow", "side", "shift"];
-const LOG_DEFAULTS: LogDefaultState[] = ["open", "closed"];
+const DRAFT_CARD_PREVIEW_MODES: DraftCardPreviewMode[] = ["none", ...CARD_PREVIEW_MODES];
+const DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS: Array<"disabled" | "enabled"> = ["disabled", "enabled"];
+const SPELL_PAYMENT_MODES: SpellPaymentMode[] = ["auto", "autoExceptSacrificialMana", "manual"];
 const VFX_QUALITIES: VfxQuality[] = ["full", "reduced", "minimal"];
+const MULTIPLAYER_BOARD_LAYOUTS: MultiplayerBoardLayout[] = ["auto", "focused", "split"];
 
 /** Format a speed value as a user-facing label. The slider goes 0→max where
  *  max = instant (skip animations). `0` = slowest, `1` = normal. The endpoint
@@ -132,10 +148,12 @@ export function PreferencesModal({
   onClose,
   initialTab = "gameplay",
   highlight,
+  returnFocusRef,
 }: PreferencesModalProps) {
   const { t } = useTranslation("settings");
   const setFlexEditMode = useUiStore((s) => s.setFlexEditMode);
   const boardBackgroundRef = useRef<HTMLDivElement | null>(null);
+  const visualTabRef = useRef<HTMLButtonElement>(null);
   const [highlightFlash, setHighlightFlash] = useState(highlight === "board-background");
 
   useEffect(() => {
@@ -157,8 +175,9 @@ export function PreferencesModal({
   const commandZoneDisplay = usePreferencesStore((s) => s.commandZoneDisplay);
   const collapseLands = usePreferencesStore((s) => s.collapseLands);
   const collapseSupport = usePreferencesStore((s) => s.collapseSupport);
-  const logDefaultState = usePreferencesStore((s) => s.logDefaultState);
+  const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const spellPaymentMode = usePreferencesStore((s) => s.spellPaymentMode);
+  const priorityPassingMode = usePreferencesStore((s) => s.priorityPassingMode);
   const boardBackground = usePreferencesStore((s) => s.boardBackground);
   const vfxQuality = usePreferencesStore((s) => s.vfxQuality);
   const animationSpeedMultiplier = usePreferencesStore((s) => s.animationSpeedMultiplier);
@@ -167,8 +186,9 @@ export function PreferencesModal({
   const setCommandZoneDisplay = usePreferencesStore((s) => s.setCommandZoneDisplay);
   const setCollapseLands = usePreferencesStore((s) => s.setCollapseLands);
   const setCollapseSupport = usePreferencesStore((s) => s.setCollapseSupport);
-  const setLogDefaultState = usePreferencesStore((s) => s.setLogDefaultState);
+  const setMultiplayerBoardLayout = usePreferencesStore((s) => s.setMultiplayerBoardLayout);
   const setSpellPaymentMode = usePreferencesStore((s) => s.setSpellPaymentMode);
+  const setPriorityPassingMode = usePreferencesStore((s) => s.setPriorityPassingMode);
   const setBoardBackground = usePreferencesStore((s) => s.setBoardBackground);
   const customBackgroundUrl = usePreferencesStore((s) => s.customBackgroundUrl);
   const setCustomBackgroundUrl = usePreferencesStore((s) => s.setCustomBackgroundUrl);
@@ -185,14 +205,22 @@ export function PreferencesModal({
   const setSfxVolume = usePreferencesStore((s) => s.setSfxVolume);
   const setMusicVolume = usePreferencesStore((s) => s.setMusicVolume);
   const setAnimationSpeedMultiplier = usePreferencesStore((s) => s.setAnimationSpeedMultiplier);
+  const nativeEngineEnabled = usePreferencesStore((s) => s.nativeEngineEnabled);
+  const setNativeEngineEnabled = usePreferencesStore((s) => s.setNativeEngineEnabled);
   const showKeywordStrip = usePreferencesStore((s) => s.showKeywordStrip) ?? true;
   const setShowKeywordStrip = usePreferencesStore((s) => s.setShowKeywordStrip);
   const battlefieldPeekOnHover = usePreferencesStore((s) => s.battlefieldPeekOnHover) ?? true;
   const setBattlefieldPeekOnHover = usePreferencesStore((s) => s.setBattlefieldPeekOnHover);
   const cardPreviewMode = usePreferencesStore((s) => s.cardPreviewMode) ?? "follow";
   const setCardPreviewMode = usePreferencesStore((s) => s.setCardPreviewMode);
+  const draftCardPreviewMode = usePreferencesStore((s) => s.draftCardPreviewMode) ?? "none";
+  const setDraftCardPreviewMode = usePreferencesStore((s) => s.setDraftCardPreviewMode);
+  const draftDoubleClickConfirmPick = usePreferencesStore((s) => s.draftDoubleClickConfirmPick) ?? true;
+  const setDraftDoubleClickConfirmPick = usePreferencesStore((s) => s.setDraftDoubleClickConfirmPick);
   const cardPreviewHoverDelayMs = usePreferencesStore((s) => s.cardPreviewHoverDelayMs) ?? 0;
   const setCardPreviewHoverDelayMs = usePreferencesStore((s) => s.setCardPreviewHoverDelayMs);
+  const showCardPreviewFooter = usePreferencesStore((s) => s.showCardPreviewFooter) ?? true;
+  const setShowCardPreviewFooter = usePreferencesStore((s) => s.setShowCardPreviewFooter);
   const artChain = usePreferencesStore((s) => s.artChain);
   const addArtChainEntry = usePreferencesStore((s) => s.addArtChainEntry);
   const removeArtChainEntry = usePreferencesStore((s) => s.removeArtChainEntry);
@@ -297,8 +325,9 @@ export function PreferencesModal({
       title={t("modal.title")}
       subtitle={t("modal.subtitle")}
       onClose={onClose}
+      returnFocusRef={returnFocusRef}
       maxWidthClassName="max-w-5xl"
-      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden pl-4 pt-4 pr-1.5 pb-8 sm:pl-6 sm:pt-6 sm:pr-2 sm:pb-10"
+      bodyClassName="flex min-h-0 flex-1 flex-col overflow-hidden pl-4 pt-4 pr-1.5 pb-8 sm:pl-6 sm:pt-6 sm:pr-2 sm:pb-10 lg:h-[36rem]"
     >
       <div className="flex min-h-0 flex-1 flex-col gap-4 md:min-h-[28rem] md:flex-row md:overflow-hidden">
             <aside className="flex shrink-0 flex-col md:w-[200px] md:justify-between">
@@ -306,6 +335,7 @@ export function PreferencesModal({
                 {SETTINGS_TABS.map((tab) => (
                   <button
                     key={tab.id}
+                    ref={tab.id === "visual" ? visualTabRef : undefined}
                     onClick={() => setActiveTab(tab.id)}
                     className={`min-h-11 shrink-0 snap-start rounded-[16px] border px-3 py-2.5 text-left text-[11px] font-semibold uppercase tracking-[0.16em] transition-colors md:w-full md:px-4 md:text-xs md:tracking-[0.18em] ${
                       activeTab === tab.id
@@ -359,6 +389,27 @@ export function PreferencesModal({
                     />
                   </SettingGroup>
 
+                  <SettingGroup label={t("gameplay.autoPass")}>
+                    <label className="flex min-h-11 items-start gap-2">
+                      <input
+                        type="checkbox"
+                        checked={priorityPassingMode === "SkipLowUseWindows"}
+                        onChange={(event) => {
+                          setPriorityPassingMode(
+                            event.target.checked ? "SkipLowUseWindows" : "Standard",
+                          );
+                        }}
+                        className="mt-1 accent-cyan-500"
+                      />
+                      <span className="text-sm text-slate-200">
+                        {t("gameplay.skipLowUsePriorityWindows")}
+                        <span className="mt-0.5 block text-xs leading-relaxed text-slate-400">
+                          {t("gameplay.skipLowUsePriorityWindowsDescription")}
+                        </span>
+                      </span>
+                    </label>
+                  </SettingGroup>
+
                   <SettingGroup label={t("gameplay.commandZone")}>
                     <SegmentedControl
                       options={COMMAND_ZONE_DISPLAYS}
@@ -386,26 +437,31 @@ export function PreferencesModal({
                     />
                   </SettingGroup>
 
-                  <SettingGroup label={t("gameplay.logDefault")}>
+                  <SettingGroup label={t("gameplay.spellPayment")}>
                     <SegmentedControl
-                      options={LOG_DEFAULTS}
-                      value={logDefaultState}
-                      onChange={setLogDefaultState}
-                      renderLabel={(opt) => t(`gameplay.logDefaultOptions.${opt}`)}
+                      options={SPELL_PAYMENT_MODES}
+                      value={spellPaymentMode}
+                      onChange={setSpellPaymentMode}
+                      renderLabel={(option) => t(`gameplay.spellPaymentOptions.${option}`)}
                     />
                   </SettingGroup>
 
-                  <SettingGroup label={t("gameplay.spellPayment")}>
-                    <label className="flex min-h-11 items-center gap-2">
+                  {isDesktopTauri() && (
+                    <label className="mt-1 flex min-h-11 items-start gap-2">
                       <input
                         type="checkbox"
-                        checked={spellPaymentMode === "manual"}
-                        onChange={(e) => setSpellPaymentMode(e.target.checked ? "manual" : "auto")}
-                        className="accent-cyan-500"
+                        checked={nativeEngineEnabled}
+                        onChange={(e) => setNativeEngineEnabled(e.target.checked)}
+                        className="mt-1 accent-cyan-500"
                       />
-                      <span className="text-sm text-slate-200">{t("gameplay.manualManaPayment")}</span>
+                      <span className="text-sm text-slate-200">
+                        {t("gameplay.nativeEngine")}
+                        <span className="mt-0.5 block text-xs text-slate-400">
+                          {t("gameplay.nativeEngineDescription")}
+                        </span>
+                      </span>
                     </label>
-                  </SettingGroup>
+                  )}
 
                   <div
                     ref={boardBackgroundRef}
@@ -475,6 +531,15 @@ export function PreferencesModal({
                     </label>
                   </SettingGroup>
 
+                  <SettingGroup label={t("visual.multiplayerBoardLayout")}>
+                    <SegmentedControl
+                      options={MULTIPLAYER_BOARD_LAYOUTS}
+                      value={multiplayerBoardLayout}
+                      onChange={setMultiplayerBoardLayout}
+                      renderLabel={(opt) => t(`visual.multiplayerBoardLayoutOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
                   <SettingGroup label={t("visual.cardPreview")}>
                     <SegmentedControl
                       options={CARD_PREVIEW_MODES}
@@ -485,6 +550,29 @@ export function PreferencesModal({
                     <p className="mt-1.5 text-xs text-slate-400">
                       {t(`visual.cardPreviewHint.${cardPreviewMode}`)}
                     </p>
+                  </SettingGroup>
+
+                  <SettingGroup label={t("visual.draftCardPreview")}>
+                    <SegmentedControl
+                      options={DRAFT_CARD_PREVIEW_MODES}
+                      value={draftCardPreviewMode}
+                      onChange={setDraftCardPreviewMode}
+                      renderLabel={(option) => option === "none"
+                        ? t("visual.draftCardPreviewOff")
+                        : t(`visual.cardPreviewOptions.${option}`)}
+                    />
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      {t("visual.draftCardPreviewHint")}
+                    </p>
+                  </SettingGroup>
+
+                  <SettingGroup label={t("visual.draftDoubleClickConfirmPick")}>
+                    <SegmentedControl
+                      options={DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS}
+                      value={draftDoubleClickConfirmPick ? "enabled" : "disabled"}
+                      onChange={(option) => setDraftDoubleClickConfirmPick(option === "enabled")}
+                      renderLabel={(option) => t(`visual.draftDoubleClickConfirmPickOptions.${option}`)}
+                    />
                   </SettingGroup>
 
                   {/* Hover latency only applies to the hover-driven modes; the
@@ -515,6 +603,23 @@ export function PreferencesModal({
                     </SettingGroup>
                   )}
 
+                  <SettingGroup label={t("visual.cardPreviewFooter")}>
+                    <label className="flex min-h-11 items-center gap-2">
+                      <input
+                        type="checkbox"
+                        checked={showCardPreviewFooter}
+                        onChange={(e) => setShowCardPreviewFooter(e.target.checked)}
+                        className="accent-cyan-500"
+                      />
+                      <span className="text-sm text-slate-200">
+                        {t("visual.showCardPreviewFooter")}
+                      </span>
+                    </label>
+                    <p className="mt-1.5 text-xs text-slate-400">
+                      {t("visual.cardPreviewFooterHint")}
+                    </p>
+                  </SettingGroup>
+
                   <SettingGroup label={t("visual.cardArtPreferences")}>
                     <ArtChainEditor
                       chain={artChain}
@@ -526,6 +631,7 @@ export function PreferencesModal({
                       <ClearArtOverridesButton
                         count={artOverrideCount}
                         onClear={clearAllArtOverrides}
+                        successFocusRef={visualTabRef}
                       />
                     )}
                   </SettingGroup>
@@ -648,7 +754,7 @@ export function PreferencesModal({
                           type="button"
                           onClick={handleImportTheme}
                           disabled={themeImportStatus === "loading" || !themeImportUrl.trim()}
-                          className="rounded-[14px] border border-white/10 bg-sky-600/30 px-4 py-2 text-sm text-slate-100 hover:bg-sky-600/50 disabled:opacity-50"
+                          className="rounded-[14px] border border-white/10 bg-sky-600/30 px-4 py-2 text-sm text-white hover:bg-sky-600/50 disabled:opacity-50"
                         >
                           {themeImportStatus === "loading" ? t("audioTheme.loading") : t("audioTheme.import")}
                         </button>
@@ -701,6 +807,7 @@ export function PreferencesModal({
 
               {activeTab === "data" && (
         <>
+          <VisualPackManager />
           <CloudSyncSection />
           <DataSection />
         </>
@@ -717,21 +824,26 @@ export function PreferencesModal({
 function ClearArtOverridesButton({
   count,
   onClear,
+  successFocusRef,
 }: {
   count: number;
   onClear: () => void;
+  successFocusRef: RefObject<HTMLButtonElement | null>;
 }) {
   const { t } = useTranslation("settings");
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   const onConfirm = useCallback(() => {
+    successFocusRef.current?.focus();
     onClear();
     setConfirmOpen(false);
-  }, [onClear]);
+  }, [onClear, successFocusRef]);
 
   return (
     <>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setConfirmOpen(true)}
         className="mt-2 rounded-[14px] border border-white/10 bg-white/5 px-3 py-1.5 text-xs text-slate-200 transition hover:bg-white/10"
@@ -746,6 +858,7 @@ function ClearArtOverridesButton({
         onConfirm={onConfirm}
         onCancel={() => setConfirmOpen(false)}
         tone="danger"
+        returnFocusRef={triggerRef}
       />
     </>
   );
@@ -762,6 +875,7 @@ function ResetAllFooter({
 }) {
   const { t } = useTranslation("settings");
   const [confirmOpen, setConfirmOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
   const onConfirm = useCallback(() => {
     resetAllPreferences();
@@ -771,6 +885,7 @@ function ResetAllFooter({
   return (
     <>
       <button
+        ref={triggerRef}
         type="button"
         onClick={() => setConfirmOpen(true)}
         className="text-xs font-medium uppercase tracking-[0.18em] text-slate-500 transition-colors hover:text-rose-300"
@@ -785,6 +900,7 @@ function ResetAllFooter({
         onConfirm={onConfirm}
         onCancel={() => setConfirmOpen(false)}
         tone="danger"
+        returnFocusRef={triggerRef}
       />
     </>
   );
@@ -940,6 +1056,12 @@ function CloudSyncSection() {
                 >
                   {t("sync.keepLocal")}
                 </button>
+                <button
+                  className={SYNC_BUTTON_CLASS}
+                  onClick={() => void resolveConflict("merge")}
+                >
+                  {t("sync.keepBothDecks")}
+                </button>
               </div>
             </div>
           ) : (
@@ -972,7 +1094,10 @@ function CloudSyncSection() {
 
 function DataSection() {
   const { t } = useTranslation("settings");
+  const telemetryEnabled = usePreferencesStore((s) => s.telemetryEnabled);
+  const setTelemetryEnabled = usePreferencesStore((s) => s.setTelemetryEnabled);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const importButtonRef = useRef<HTMLButtonElement>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [pendingImportFile, setPendingImportFile] = useState<File | null>(null);
@@ -1039,6 +1164,7 @@ function DataSection() {
           {t("data.exportBackup")}
         </button>
         <button
+          ref={importButtonRef}
           onClick={() => {
             fileInputRef.current?.click();
           }}
@@ -1070,9 +1196,22 @@ function DataSection() {
         onCancel={dismissImportDialog}
         tone="danger"
         secondaryTone="primary"
+        returnFocusRef={importButtonRef}
       />
       {status && <p className="text-xs text-emerald-400">{status}</p>}
       {error && <p className="text-xs text-rose-400">{error}</p>}
+      <label className="mt-1 flex min-h-11 items-start gap-2">
+        <input
+          type="checkbox"
+          checked={telemetryEnabled}
+          onChange={(e) => setTelemetryEnabled(e.target.checked)}
+          className="mt-1 accent-cyan-500"
+        />
+        <span className="text-sm text-slate-200">
+          {t("data.telemetry")}
+          <span className="mt-0.5 block text-xs text-slate-400">{t("data.telemetryDescription")}</span>
+        </span>
+      </label>
     </SettingsSection>
   );
 }
@@ -1148,7 +1287,7 @@ function MultiplierSlider({
           onChange={(e) => onChange(Number(e.target.value))}
           onDoubleClick={() => onChange(defaultValue)}
           aria-label={label}
-          className="flex-1 accent-cyan-500"
+          className="h-2 flex-1 cursor-pointer rounded-full bg-slate-700 accent-cyan-500 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-200 focus-visible:outline-offset-2 focus-visible:ring-2 focus-visible:ring-cyan-400/70"
         />
         <button
           type="button"
@@ -1273,12 +1412,6 @@ const ART_CHAIN_RULE_OPTIONS: { type: ArtChainEntry["type"]; labelKey: string }[
   { type: "prefer_extended", labelKey: "artChain.rules.preferExtended" },
 ];
 
-interface ScryfallSetInfo {
-  name: string;
-  icon_svg_uri: string;
-  released_at: string;
-}
-
 function artChainEntryLabel(entry: ArtChainEntry, t: TFunction<"settings">): string {
   switch (entry.type) {
     // `entry.label` is the Scryfall set name (engine/asset data) — left raw.
@@ -1308,14 +1441,7 @@ function ArtChainEditor({
 }) {
   const { t } = useTranslation("settings");
   const [setInput, setSetInput] = useState("");
-  const [scryfallSets, setScryfallSets] = useState<Record<string, ScryfallSetInfo> | null>(null);
-
-  useEffect(() => {
-    fetch(__SCRYFALL_SETS_URL__)
-      .then((r) => r.json() as Promise<Record<string, ScryfallSetInfo>>)
-      .then(setScryfallSets)
-      .catch(() => {});
-  }, []);
+  const { catalog: scryfallSets } = useSetCatalog();
 
   const resolveSetCode = useCallback(
     (input: string): { code: string; label: string } | null => {
@@ -1448,7 +1574,7 @@ function ArtChainEditor({
             type="button"
             onClick={handleAddSet}
             disabled={!resolveSetCode(setInput)}
-            className="rounded-[14px] border border-white/10 bg-sky-600/30 px-4 py-2 text-sm text-slate-100 hover:bg-sky-600/50 disabled:opacity-50"
+            className="rounded-[14px] border border-white/10 bg-sky-600/30 px-4 py-2 text-sm text-white hover:bg-sky-600/50 disabled:opacity-50"
           >
             {t("artChain.addSet")}
           </button>

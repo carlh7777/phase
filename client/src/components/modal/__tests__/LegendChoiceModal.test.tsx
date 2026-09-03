@@ -4,7 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { GameState } from "../../../adapter/types.ts";
 import { useGameStore } from "../../../stores/gameStore.ts";
 import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
-import { buildGameObject } from "../../../test/factories/gameObjectFactory.ts";
+import { buildGameObject, buildObjectMap } from "../../../test/factories/gameObjectFactory.ts";
+import { buildGameState, buildPlayers } from "../../../test/factories/gameStateFactory.ts";
 import { CardChoiceModal } from "../CardChoiceModal.tsx";
 
 const dispatchMock = vi.fn();
@@ -30,46 +31,46 @@ function makeState(): GameState {
     card_id: 11,
     name: "Thalia, Guardian of Thraben",
     entered_battlefield_turn: 2,
+    is_token: true,
+    display_source: "Card",
     card_types: {
       supertypes: ["Legendary"],
       core_types: ["Creature"],
       subtypes: ["Human", "Soldier"],
     },
   });
+  const hidden = buildGameObject({
+    id: 12,
+    card_id: 12,
+    name: "Face-down permanent",
+    entered_battlefield_turn: 1,
+    face_down: true,
+  });
 
-  return {
+  return buildGameState({
     turn_number: 2,
-    active_player: 0,
-    phase: "PreCombatMain",
-    players: [
-      { id: 0, life: 20, poison_counters: 0, mana_pool: { mana: [] }, library: [], hand: [], graveyard: [], has_drawn_this_turn: false, lands_played_this_turn: 0, turns_taken: 0 },
-      { id: 1, life: 20, poison_counters: 0, mana_pool: { mana: [] }, library: [], hand: [], graveyard: [], has_drawn_this_turn: false, lands_played_this_turn: 0, turns_taken: 0 },
-    ],
+    players: buildPlayers([0, 1]),
     priority_player: 0,
-    objects: { 10: existing, 11: newCopy },
-    next_object_id: 12,
-    battlefield: [10, 11],
-    stack: [],
-    exile: [],
-    rng_seed: 1,
-    combat: null,
+    objects: buildObjectMap(existing, newCopy, hidden),
+    next_object_id: 13,
+    battlefield: [10, 11, 12],
+    derived: {
+      legend_candidate_identities: {
+        "10": "Original",
+        "11": "TokenCopy",
+        "12": "Unknown",
+      },
+    },
     waiting_for: {
       type: "ChooseLegend",
       data: {
         player: 0,
         legend_name: "Thalia, Guardian of Thraben",
-        candidates: [10, 11],
+        candidates: [10, 11, 12],
       },
     },
-    has_pending_cast: false,
-    lands_played_this_turn: 0,
-    max_lands_per_turn: 1,
-    priority_pass_count: 0,
-    pending_replacement: null,
-    layers_dirty: false,
     next_timestamp: 3,
-    eliminated_players: [],
-  } as unknown as GameState;
+  });
 }
 
 describe("LegendChoiceModal", () => {
@@ -88,11 +89,19 @@ describe("LegendChoiceModal", () => {
     cleanup();
   });
 
-  it("labels existing and newly entered legendary candidates", () => {
+  it("identifies the original and token-copy legend candidates", () => {
     render(<CardChoiceModal />);
 
-    expect(screen.getByText("Already on battlefield")).toBeInTheDocument();
+    expect(screen.getAllByText("Already on battlefield")).toHaveLength(2);
     expect(screen.getByText("Just entered")).toBeInTheDocument();
+    expect(screen.getByText("Original")).toBeInTheDocument();
+    expect(screen.getByText("Token copy")).toBeInTheDocument();
+    expect(screen.queryByText("Unknown")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", {
+        name: "Keep Face-down permanent (Already on battlefield)",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("dispatches the selected legend to keep", () => {
@@ -100,7 +109,7 @@ describe("LegendChoiceModal", () => {
 
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Keep Thalia, Guardian of Thraben (Just entered)",
+        name: "Keep Thalia, Guardian of Thraben (Token copy, Just entered)",
       }),
     );
 

@@ -101,6 +101,7 @@ pub fn resolve(
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::Heist,
             source_id,
+            subject: None,
         });
         return Ok(());
     }
@@ -118,7 +119,7 @@ pub fn resolve(
     // `HeistExile` carries no `sub_ability`, the unchosen candidates are never
     // forwarded anywhere — they simply stay in the library.
     let finalize = ResolvedAbility::new(Effect::HeistExile, vec![], source_id, controller);
-    state.pending_continuation = Some(PendingContinuation::new(Box::new(finalize)));
+    state.park_ability_continuation(PendingContinuation::new(Box::new(finalize), state));
 
     state.waiting_for = WaitingFor::ChooseFromZoneChoice {
         player: controller,
@@ -132,6 +133,7 @@ pub fn resolve(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Heist,
         source_id,
+        subject: None,
     });
 
     Ok(())
@@ -209,16 +211,20 @@ pub fn resolve_exile(
             if let Some(obj) = state.objects.get_mut(&obj_id) {
                 obj.casting_permissions
                     .push(CastingPermission::PlayFromExile {
+                        provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                        mode: crate::types::ability::CardPlayMode::Play,
                         duration: crate::types::ability::Duration::Permanent,
                         granted_to: controller,
                         frequency: CastFrequency::Unlimited,
                         source_id: Some(source_id),
+                        invalidation: None,
                         exiled_by_ability_controller: Some(controller),
                         mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
                         card_filter: None,
                         single_use_group: None,
                         single_use: false,
                         cast_cost_raise: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     });
             }
@@ -228,6 +234,7 @@ pub fn resolve_exile(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::HeistExile,
         source_id,
+        subject: None,
     });
 
     Ok(())

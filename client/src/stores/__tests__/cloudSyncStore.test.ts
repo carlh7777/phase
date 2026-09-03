@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PhaseBackup } from "../../services/backup";
 import type {
   CloudSyncProvider,
@@ -7,23 +7,36 @@ import type {
 } from "../../services/cloudSync";
 
 // Hoisted mock fns so the vi.mock factories below can reference them.
-const { buildBackupMock, applyBackupMock, getProvider } = vi.hoisted(() => ({
+const {
+  buildBackupMock,
+  applyBackupMock,
+  mergeDeckCollectionsMock,
+  getProvider,
+  watchUserStorageMock,
+  watcherUnsubscribeMock,
+  withStorageWatchSuppressedMock,
+} = vi.hoisted(() => ({
   buildBackupMock: vi.fn(),
   applyBackupMock: vi.fn(),
+  mergeDeckCollectionsMock: vi.fn(),
   getProvider: vi.fn(),
+  watchUserStorageMock: vi.fn(),
+  watcherUnsubscribeMock: vi.fn(),
+  withStorageWatchSuppressedMock: vi.fn(),
 }));
 
 vi.mock("../../services/backup", () => ({
   buildBackup: buildBackupMock,
   applyBackup: applyBackupMock,
+  mergeDeckCollections: mergeDeckCollectionsMock,
 }));
 vi.mock("../../services/cloudSync", () => ({
   getCloudSyncProvider: getProvider,
   SyncConflictError: class SyncConflictError extends Error {},
 }));
 vi.mock("../../services/cloudSync/storageWatcher", () => ({
-  watchUserStorage: () => () => {},
-  withStorageWatchSuppressed: (fn: () => void) => fn(),
+  watchUserStorage: watchUserStorageMock,
+  withStorageWatchSuppressed: withStorageWatchSuppressedMock,
 }));
 
 import { useCloudSyncStore } from "../cloudSyncStore";
@@ -76,10 +89,44 @@ let provider: {
   pullMeta: ReturnType<typeof vi.fn>;
   pull: ReturnType<typeof vi.fn>;
   push: ReturnType<typeof vi.fn>;
+  restoreSession: ReturnType<typeof vi.fn>;
+  subscribe: ReturnType<typeof vi.fn>;
 };
+let watchedStorageCallback: ((key: string) => void) | undefined;
+let storageWatchSuppressionDepth = 0;
+let applyBackupSuppressionDepths: number[] = [];
+const storageDirtyNotification = vi.fn();
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();
+  watchedStorageCallback = undefined;
+  storageWatchSuppressionDepth = 0;
+  applyBackupSuppressionDepths = [];
+  watchUserStorageMock.mockImplementation((callback: (key: string) => void) => {
+    watchedStorageCallback = (key) => {
+      storageDirtyNotification(key);
+      callback(key);
+    };
+    return watcherUnsubscribeMock;
+  });
+  withStorageWatchSuppressedMock.mockImplementation((fn: () => void) => {
+    storageWatchSuppressionDepth += 1;
+    try {
+      fn();
+    } finally {
+      storageWatchSuppressionDepth -= 1;
+    }
+  });
+  applyBackupMock.mockImplementation(() => {
+    applyBackupSuppressionDepths.push(storageWatchSuppressionDepth);
+    if (storageWatchSuppressionDepth === 0) {
+      watchedStorageCallback?.("phase-deck:portable-profile-write");
+    }
+  });
   Object.defineProperty(window, "location", {
     configurable: true,
     value: { href: "http://localhost/", reload: reloadMock },
@@ -89,6 +136,8 @@ beforeEach(() => {
     pullMeta: vi.fn(),
     pull: vi.fn(),
     push: vi.fn(),
+    restoreSession: vi.fn().mockResolvedValue(null),
+    subscribe: vi.fn(() => () => {}),
   };
   getProvider.mockReturnValue(provider as unknown as CloudSyncProvider);
   useCloudSyncStore.setState({
@@ -247,5 +296,107 @@ describe("cloudSyncStore.syncNow reconciliation", () => {
     expect(s.status).toBe("synced");
     expect(s.lastSyncedRevision).toBe(1);
     expect(provider.push).toHaveBeenLastCalledWith(expect.anything(), null);
+  });
+});
+
+describe("cloudSyncStore.resolveConflict", () => {
+  it("publishes a merged deck collection before applying it locally", async () => {
+    const local = fakeBackup({ decks: { Local: "local" } });
+    const remoteSnapshot = remote(5);
+    const merged = fakeBackup({ decks: { Local: "local", "Cloud Deck": "cloud" } });
+    useCloudSyncStore.setState({
+      conflict: remoteSnapshot,
+      conflictDiff: null,
+      status: "conflict",
+    });
+    buildBackupMock.mockReturnValue(local);
+    mergeDeckCollectionsMock.mockReturnValue(merged);
+    provider.push.mockResolvedValue({ revision: 6, updatedAt: "t" });
+
+    await useCloudSyncStore.getState().resolveConflict("merge");
+
+    expect(mergeDeckCollectionsMock).toHaveBeenCalledWith(local, remoteSnapshot.backup);
+    expect(provider.push).toHaveBeenCalledWith(merged, 5);
+    expect(applyBackupMock).toHaveBeenCalledWith(merged, "overwrite");
+    expect(useCloudSyncStore.getState().lastSyncedRevision).toBe(6);
+  });
+});
+
+describe("cloudSyncStore storage watcher integration", () => {
+  it("marks local storage writes dirty, debounces sync, and cleans up its watcher registration", async () => {
+    vi.useFakeTimers();
+    provider.restoreSession.mockReturnValue(new Promise(() => {}));
+    provider.pullMeta.mockResolvedValue(null);
+    buildBackupMock.mockReturnValue(fakeBackup());
+    provider.push.mockResolvedValue({ revision: 1, updatedAt: "t" });
+    const cleanup = useCloudSyncStore.getState().init();
+
+    expect(watchUserStorageMock).toHaveBeenCalledTimes(1);
+    watchedStorageCallback?.("phase-deck:portable-profile-write");
+    await Promise.resolve();
+
+    expect(useCloudSyncStore.getState().dirty).toBe(true);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(provider.pullMeta).toHaveBeenCalledTimes(1);
+    cleanup();
+    expect(watcherUnsubscribeMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves the watcher available to independent subscribers when no provider is configured", () => {
+    getProvider.mockReturnValue(null);
+
+    const cleanup = useCloudSyncStore.getState().init();
+
+    expect(watchUserStorageMock).not.toHaveBeenCalled();
+    expect(useCloudSyncStore.getState().sessionResolved).toBe(true);
+    cleanup();
+  });
+
+  it("applies a remote snapshot while storage notification is suppressed", async () => {
+    const cleanup = useCloudSyncStore.getState().init();
+    provider.pullMeta.mockResolvedValue(meta(5));
+    provider.pull.mockResolvedValue(remote(5));
+    buildBackupMock.mockReturnValue(fakeBackup());
+
+    await useCloudSyncStore.getState().syncNow();
+
+    expect(applyBackupMock).toHaveBeenCalledWith(remote(5).backup, "overwrite");
+    expect(applyBackupSuppressionDepths).toEqual([1]);
+    expect(storageDirtyNotification).not.toHaveBeenCalled();
+
+    applyBackupMock(fakeBackup());
+    await Promise.resolve();
+    expect(storageDirtyNotification).toHaveBeenCalledWith(
+      "phase-deck:portable-profile-write",
+    );
+    cleanup();
+  });
+
+  it("applies a merged deck collection while storage notification is suppressed", async () => {
+    const cleanup = useCloudSyncStore.getState().init();
+    const local = fakeBackup({ decks: { Local: "local" } });
+    const remoteSnapshot = remote(5);
+    const merged = fakeBackup({ decks: { Local: "local", "Cloud Deck": "cloud" } });
+    useCloudSyncStore.setState({
+      conflict: remoteSnapshot,
+      conflictDiff: null,
+      status: "conflict",
+    });
+    buildBackupMock.mockReturnValue(local);
+    mergeDeckCollectionsMock.mockReturnValue(merged);
+    provider.push.mockResolvedValue({ revision: 6, updatedAt: "t" });
+
+    await useCloudSyncStore.getState().resolveConflict("merge");
+
+    expect(applyBackupMock).toHaveBeenCalledWith(merged, "overwrite");
+    expect(applyBackupSuppressionDepths).toEqual([1]);
+    expect(storageDirtyNotification).not.toHaveBeenCalled();
+
+    applyBackupMock(fakeBackup());
+    await Promise.resolve();
+    expect(storageDirtyNotification).toHaveBeenCalledWith(
+      "phase-deck:portable-profile-write",
+    );
+    cleanup();
   });
 });

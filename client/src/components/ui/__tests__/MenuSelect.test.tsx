@@ -91,7 +91,7 @@ describe("MenuSelect", () => {
 
     const listbox = screen.getByRole("listbox");
     expect(listbox).toBeInTheDocument();
-    expect(listbox.className).toContain("rounded-xl");
+    expect(listbox.className).toContain("rounded-[8px]");
     expect(listbox.className).not.toContain("rounded-t-2xl");
     expect(screen.queryByRole("button", { name: "All types" })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "All types" })).toHaveLength(1);
@@ -156,6 +156,26 @@ describe("MenuSelect", () => {
     fireEvent.change(search, { target: { value: "zzz" } });
     expect(screen.queryAllByRole("option")).toHaveLength(0);
     expect(screen.getByText("No decks match")).toBeInTheDocument();
+  });
+
+  it("keeps a filterable menu open while an IME composition is active", () => {
+    render(
+      <MenuSelect
+        label="Load deck..."
+        items={items}
+        onSelect={vi.fn()}
+        filterable
+        filterPlaceholder="Search decks…"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Load deck..." }));
+    const search = screen.getByPlaceholderText("Search decks…");
+
+    fireEvent.keyDown(search, { key: "Escape", isComposing: true });
+    fireEvent.keyDown(search, { key: "Escape", keyCode: 229 });
+
+    expect(screen.getByRole("listbox", { name: "Load deck..." })).toBeInTheDocument();
+    expect(search).toHaveFocus();
   });
 
   it("filters grouped options and drops groups with no matches", () => {

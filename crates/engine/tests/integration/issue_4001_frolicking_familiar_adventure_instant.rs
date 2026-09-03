@@ -26,10 +26,12 @@ fn add_mana(runner: &mut GameRunner, player: PlayerId, color: ManaType, count: u
 
 fn blow_off_steam_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: "Blow Off Steam".to_string(),
         power: None,
         toughness: None,
         loyalty: None,
+        printed_loyalty: None,
         defense: None,
         card_types: {
             let mut ct = CardType::default();
@@ -48,6 +50,7 @@ fn blow_off_steam_back_face() -> BackFaceData {
                 amount: QuantityExpr::Fixed { value: 2 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         )],
         trigger_definitions: Default::default(),
@@ -61,6 +64,7 @@ fn blow_off_steam_back_face() -> BackFaceData {
         casting_restrictions: Vec::new(),
         casting_options: Vec::new(),
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

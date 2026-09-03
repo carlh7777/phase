@@ -91,6 +91,36 @@ impl DraftSession {
         }
     }
 
+    /// Validate a disk snapshot before it becomes a live server session.
+    fn try_from_persisted(ps: PersistedDraftSession) -> Result<Self, String> {
+        let core = &ps.session;
+        let seat_count = core.seats.len();
+        if ps.draft_code != core.draft_code {
+            return Err("persisted draft code does not match core session".to_string());
+        }
+        if ps.config != core.config {
+            return Err("persisted draft configuration does not match core session".to_string());
+        }
+        if ps.config.pod_size as usize != seat_count
+            || ps.player_tokens.len() != seat_count
+            || ps.display_names.len() != seat_count
+        {
+            return Err("persisted draft seat vectors do not match core seats".to_string());
+        }
+        let mut tokens = std::collections::HashSet::new();
+        if ps
+            .player_tokens
+            .iter()
+            .filter(|token| !token.is_empty())
+            .any(|token| !tokens.insert(token))
+        {
+            return Err("persisted draft player tokens must be unique".to_string());
+        }
+        core.validate_persisted_snapshot()
+            .map_err(|error| format!("invalid persisted draft snapshot: {error}"))?;
+        Ok(Self::from_persisted(ps))
+    }
+
     /// Inject server-side timer into the filtered view before serializing.
     pub fn view_for_seat(&self, seat: usize) -> DraftPlayerView {
         let mut view = draft_core::view::filter_for_player(&self.session, seat as u8);
@@ -216,12 +246,25 @@ impl DraftSessionManager {
         &mut self,
         draft_code: &str,
         display_name: String,
-        _password: Option<&str>,
+        password: Option<&str>,
     ) -> Result<(String, u8, DraftPlayerView), String> {
         let session = self
             .sessions
             .get_mut(draft_code)
             .ok_or_else(|| format!("Draft not found: {}", draft_code))?;
+
+        if let Some(meta) = &session.lobby_meta {
+            match (&meta.password, password) {
+                (None, _) => {}
+                (Some(_), None) => return Err("password_required".to_string()),
+                (Some(expected), Some(provided)) if expected == provided => {}
+                (Some(_), Some(_)) => return Err("Wrong password".to_string()),
+            }
+        }
+
+        if session.session.status != DraftStatus::Lobby {
+            return Err("Draft has already started".to_string());
+        }
 
         let seat = session
             .first_open_seat()
@@ -285,11 +328,17 @@ impl DraftSessionManager {
         // auto-report), so bot/auto picks are unaffected.
         let action = authorize_client_draft_action(seat, action)?;
 
+        let clears_lobby = matches!(action, DraftAction::StartDraft);
+
         let _deltas = draft_core::session::apply(&mut session.session, action, pack_source)
             .map_err(|e| {
                 warn!(draft = %draft_code, error = %e, "draft action rejected");
                 format!("Draft error: {}", e)
             })?;
+
+        if clears_lobby {
+            session.lobby_meta = None;
+        }
 
         // Broadcast updated view to all connected seats
         let views: Vec<_> = (0..session.player_tokens.len())
@@ -312,11 +361,17 @@ impl DraftSessionManager {
             .get_mut(draft_code)
             .ok_or_else(|| format!("Draft not found: {}", draft_code))?;
 
+        let clears_lobby = matches!(action, DraftAction::StartDraft);
+
         let _deltas = draft_core::session::apply(&mut session.session, action, pack_source)
             .map_err(|e| {
                 warn!(draft = %draft_code, error = %e, "system draft action rejected");
                 format!("Draft error: {}", e)
             })?;
+
+        if clears_lobby {
+            session.lobby_meta = None;
+        }
 
         let views: Vec<_> = (0..session.player_tokens.len())
             .map(|i| session.view_for_seat(i))
@@ -400,6 +455,21 @@ impl DraftSessionManager {
         self.sessions.insert(draft_code, session);
     }
 
+    /// Restore an untrusted persisted snapshot only after its wrapper and core
+    /// session agree. The manager remains unchanged when validation fails.
+    pub fn restore_persisted_session(&mut self, ps: PersistedDraftSession) -> Result<(), String> {
+        let session = DraftSession::try_from_persisted(ps)?;
+        let draft_code = session.draft_code.clone();
+        for token in &session.player_tokens {
+            if !token.is_empty() {
+                self.token_to_draft
+                    .insert(token.clone(), draft_code.clone());
+            }
+        }
+        self.sessions.insert(draft_code, session);
+        Ok(())
+    }
+
     /// Auto-pick a random card for a disconnected seat whose grace period expired.
     ///
     /// Returns `Ok(())` if a pick was made. Only fires during the Drafting phase (D-02).
@@ -428,12 +498,37 @@ impl DraftSessionManager {
             return Err(format!("seat {seat} pack is empty"));
         }
 
-        let idx = rand::rng().random_range(0..pack.len());
-        let card_instance_id = pack[idx].instance_id.clone();
+        // CR 903.13b: a seat's pick step takes its kind's whole card count —
+        // one for the four CR 905.1a kinds, two for CommanderDraft — dropping
+        // to the remainder on an odd final pick. Reading the count from the
+        // procedure is what keeps the disconnected-seat auto-pick and the
+        // reducer's `expected` in agreement by construction rather than by
+        // coincidence. Was a hardcoded single id, which stalled a Commander pod
+        // at `WrongPickCardCount`.
+        //
+        // The other half of the discharged marker, decided here so it is not
+        // re-asked: `guard_create_draft_with_settings` does NOT gain a kind
+        // allowlist. `DraftKind`'s deserialization already refuses every
+        // non-variant, so an allowlist would re-express the type system as a
+        // runtime string check; the guard's job is bounding client-supplied
+        // strings and sizes before clone-heavy work, not policy; every kind is
+        // now genuinely creatable server-side, so there is nothing to deny; and
+        // an allowlist would become a second authority over which kinds exist,
+        // competing with `DraftKind::ALL`.
+        let cards_per_pick =
+            usize::from(session.session.config.kind.procedure().cards_per_pick).min(pack.len());
+        let mut rng = rand::rng();
+        // `swap_remove` off a scratch Vec draws DISTINCT ids; drawing twice by
+        // index into the pack could pick the same card twice, which the reducer
+        // rejects.
+        let mut remaining: Vec<String> = pack.iter().map(|c| c.instance_id.clone()).collect();
+        let card_instance_ids: Vec<String> = (0..cards_per_pick)
+            .map(|_| remaining.swap_remove(rng.random_range(0..remaining.len())))
+            .collect();
 
         let action = DraftAction::Pick {
             seat,
-            card_instance_id,
+            card_instance_ids,
         };
         draft_core::session::apply(&mut session.session, action, pack_source)
             .map_err(|e| format!("auto-pick failed: {e}"))?;
@@ -451,13 +546,10 @@ impl DraftSessionManager {
         if session.session.status != DraftStatus::Pairing {
             return Ok(());
         }
-        let round = session.session.current_round.max(1);
-        draft_core::session::apply(
-            &mut session.session,
-            DraftAction::GeneratePairings { round },
-            None,
-        )
-        .map_err(|e| format!("GeneratePairings failed: {e}"))?;
+        // The reducer derives the round (`DraftSession::next_pairing_round`);
+        // deriving it here is what made round 2 unreachable.
+        draft_core::session::apply(&mut session.session, DraftAction::GeneratePairings, None)
+            .map_err(|e| format!("GeneratePairings failed: {e}"))?;
         Ok(())
     }
 
@@ -538,7 +630,7 @@ impl DraftSessionManager {
                 2,
                 match_config,
                 Some(format_config.clone()),
-            );
+            )?;
             let (token1, _) = game_mgr.join_game_with_name(&game_code, decks[1].clone(), name1)?;
 
             game_mgr
@@ -631,6 +723,25 @@ fn deck_payload_from_submission(
     let deck = DeckData {
         main_deck: submission.main_deck.clone(),
         sideboard: Vec::new(),
+        // DEFERRED(out of scope -- the server-hosted draft launches 1v1
+        // pairings only). Two independent reasons this slot stays empty rather
+        // than being filled from `submission.commanders`.
+        //
+        // (1) No Commander session reaches this code:
+        // `PostDraftPlay::CompleteImmediately` maps CommanderDraft to
+        // `DraftStatus::Complete`, `apply_generate_pairings` is the only writer
+        // of `session.pairings`, and `ensure_pairings_generated` refuses to run
+        // outside `DraftStatus::Pairing` -- so the pairing loop that calls this
+        // function never has a pairing to iterate.
+        //
+        // (2) Filling it unconditionally would change the four existing kinds:
+        // `apply_submit_deck` has no per-kind gate on the designation list and
+        // `load_and_hydrate_decks` places commanders unconditionally, so a
+        // Premier/Traditional/Sealed submission carrying designations would
+        // start a `FormatConfig::limited()` game with cards in the command
+        // zone.
+        //
+        // A Commander pod launches client-side; see the pod launch path.
         commander: Vec::new(),
         attraction_deck: Vec::new(),
         signature_spell: Vec::new(),
@@ -693,20 +804,36 @@ fn authorize_client_draft_action(seat: usize, action: DraftAction) -> Result<Dra
         // Seat-scoped: overwrite the client-supplied seat with the authenticated
         // seat so a player cannot pick from or submit a deck for another seat.
         DraftAction::Pick {
-            card_instance_id, ..
+            card_instance_ids, ..
         } => Ok(DraftAction::Pick {
             seat: seat as u8,
-            card_instance_id,
+            card_instance_ids,
         }),
-        DraftAction::SubmitDeck { main_deck, .. } => Ok(DraftAction::SubmitDeck {
+        DraftAction::PickWithDraftEffect {
+            effect_card_instance_id,
+            card_instance_ids,
+            ..
+        } => Ok(DraftAction::PickWithDraftEffect {
+            seat: seat as u8,
+            effect_card_instance_id,
+            card_instance_ids,
+        }),
+        // The seat is table authority and is overwritten with the authenticated
+        // one; the designation is player data and is carried through untouched.
+        DraftAction::SubmitDeck {
+            main_deck,
+            commanders,
+            ..
+        } => Ok(DraftAction::SubmitDeck {
             seat: seat as u8,
             main_deck,
+            commanders,
         }),
         // Table authority: only the host may start the draft, advance rounds,
         // generate pairings, report results, or replace a seat with a bot.
         DraftAction::StartDraft
         | DraftAction::AdvanceRound
-        | DraftAction::GeneratePairings { .. }
+        | DraftAction::GeneratePairings
         | DraftAction::ReportMatchResult { .. }
         | DraftAction::ReplaceSeatWithBot { .. } => {
             if seat == DRAFT_HOST_SEAT {
@@ -732,9 +859,7 @@ mod tests {
 
     fn test_config() -> DraftConfig {
         DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size: 8,
@@ -749,6 +874,70 @@ mod tests {
         }
     }
 
+    /// A four-seat Commander pod (CR 903.13a; the 4-player pod is the product
+    /// default, and `min_pod_size` 3 is the CR 800.1 floor below it).
+    fn commander_test_config() -> DraftConfig {
+        let procedure = DraftKind::CommanderDraft.procedure();
+        DraftConfig {
+            kind: DraftKind::CommanderDraft,
+            pod_size: procedure.pod_size,
+            pack_count: procedure.packs_per_player,
+            min_deck_size: procedure.min_deck_size,
+            ..test_config()
+        }
+    }
+
+    fn start_pod(mgr: &mut DraftSessionManager, config: DraftConfig) -> String {
+        let pod_size = config.pod_size;
+        let (code, _host_token, _) = mgr.create_draft(config, "Alice".to_string());
+        for i in 1..pod_size {
+            mgr.join_draft(&code, format!("Player {i}"), None).unwrap();
+        }
+        let source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 14,
+        };
+        mgr.apply_system_action(&code, DraftAction::StartDraft, Some(&source))
+            .unwrap();
+        code
+    }
+
+    /// CR 903.13b: the disconnected-seat auto-pick takes the kind's WHOLE pick
+    /// step — two cards for a Commander pod.
+    ///
+    /// REVERT-PROBE: restore the hardcoded `vec![card_instance_id]` and
+    /// `pick_random_for_seat` returns `Err` (the reducer's `WrongPickCardCount`),
+    /// so the `unwrap` below panics AND the pool-length assertion fails.
+    #[test]
+    fn commander_auto_pick_takes_two_cards() {
+        let mut mgr = DraftSessionManager::new();
+        let code = start_pod(&mut mgr, commander_test_config());
+
+        mgr.pick_random_for_seat(&code, 1, None).unwrap();
+
+        let view = draft_core::view::filter_for_player(&mgr.sessions[&code].session, 1);
+        assert_eq!(
+            view.pool.len(),
+            2,
+            "CR 903.13b: a Commander pick step drafts two cards"
+        );
+        // Distinct ids: `swap_remove` must not have drawn the same card twice.
+        assert_ne!(view.pool[0].instance_id, view.pool[1].instance_id);
+    }
+
+    /// The paired control: a CR 905.1a kind still takes exactly one card, so
+    /// the change reads the procedure rather than hardcoding two.
+    #[test]
+    fn premier_auto_pick_still_takes_one_card() {
+        let mut mgr = DraftSessionManager::new();
+        let code = start_pod(&mut mgr, test_config());
+
+        mgr.pick_random_for_seat(&code, 1, None).unwrap();
+
+        let view = draft_core::view::filter_for_player(&mgr.sessions[&code].session, 1);
+        assert_eq!(view.pool.len(), 1, "CR 905.1a: one card per pick step");
+    }
+
     #[test]
     fn create_draft_returns_code_and_token() {
         let mut mgr = DraftSessionManager::new();
@@ -758,6 +947,215 @@ mod tests {
         assert_eq!(token.len(), 32);
         assert_eq!(seat, 0);
         assert!(mgr.sessions.contains_key(&code));
+    }
+
+    #[test]
+    fn join_draft_enforces_lobby_password() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, _host_token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+        mgr.sessions.get_mut(&code).unwrap().lobby_meta = Some(PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: false,
+            password: Some("secret".to_string()),
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        });
+
+        assert_eq!(
+            mgr.join_draft(&code, "Bob".to_string(), None).unwrap_err(),
+            "password_required"
+        );
+        assert_eq!(
+            mgr.join_draft(&code, "Bob".to_string(), Some("wrong"))
+                .unwrap_err(),
+            "Wrong password"
+        );
+        assert!(mgr
+            .join_draft(&code, "Bob".to_string(), Some("secret"))
+            .is_ok());
+    }
+
+    #[test]
+    fn join_draft_rejects_after_draft_started() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, _host_token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+        mgr.sessions.get_mut(&code).unwrap().lobby_meta = Some(PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: false,
+            password: Some("secret".to_string()),
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        });
+
+        for i in 1..8 {
+            mgr.join_draft(&code, format!("Player {i}"), Some("secret"))
+                .unwrap();
+        }
+
+        let source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 14,
+        };
+        mgr.apply_system_action(&code, DraftAction::StartDraft, Some(&source))
+            .unwrap();
+
+        assert!(mgr.sessions[&code].lobby_meta.is_none());
+        assert_eq!(mgr.sessions[&code].session.status, DraftStatus::Drafting);
+
+        let result = mgr.join_draft(&code, "Late".to_string(), Some("secret"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("already started"));
+    }
+
+    #[test]
+    fn started_persisted_draft_does_not_register_in_lobby() {
+        use crate::persist::restored_draft_lobby_register_request;
+
+        let mut mgr = DraftSessionManager::new();
+        let (code, _host_token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+        mgr.sessions.get_mut(&code).unwrap().lobby_meta = Some(PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: true,
+            password: None,
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        });
+
+        for i in 1..8 {
+            mgr.join_draft(&code, format!("Player {i}"), None).unwrap();
+        }
+
+        let source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 14,
+        };
+        mgr.apply_system_action(&code, DraftAction::StartDraft, Some(&source))
+            .unwrap();
+
+        // Simulate legacy persistence that still carried lobby_meta after start.
+        let mut persisted = mgr.sessions[&code].to_persisted();
+        persisted.lobby_meta = Some(PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: true,
+            password: None,
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        });
+
+        assert!(restored_draft_lobby_register_request(&persisted).is_none());
+    }
+
+    #[test]
+    fn restore_registration_path_registers_only_lobby_status_drafts() {
+        use std::cell::Cell;
+
+        use lobby_broker::{BrokerEnv, LobbyManager};
+
+        use crate::persist::restored_draft_lobby_register_request;
+
+        struct TestEnv {
+            now: Cell<u64>,
+        }
+
+        impl BrokerEnv for TestEnv {
+            fn now_ms(&self) -> u64 {
+                self.now.get()
+            }
+
+            fn new_token(&self) -> String {
+                "tok".to_string()
+            }
+
+            fn new_game_code(&self) -> String {
+                "CODE".to_string()
+            }
+        }
+
+        fn register_restored_draft(
+            lob: &mut LobbyManager,
+            draft_code: &str,
+            ps: &crate::persist::PersistedDraftSession,
+            env: &TestEnv,
+        ) {
+            if let Some(req) = restored_draft_lobby_register_request(ps) {
+                lob.register_game(draft_code, req, env);
+            }
+        }
+
+        let env = TestEnv {
+            now: Cell::new(1_000_000),
+        };
+        let mut lob = LobbyManager::new();
+        let meta = PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: true,
+            password: Some("secret".to_string()),
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        };
+
+        // Still in lobby — should register on restore.
+        let mut lobby_mgr = DraftSessionManager::new();
+        let (lobby_code, _host_token, _) =
+            lobby_mgr.create_draft(test_config(), "Alice".to_string());
+        lobby_mgr.sessions.get_mut(&lobby_code).unwrap().lobby_meta = Some(meta.clone());
+        let lobby_ps = lobby_mgr.sessions[&lobby_code].to_persisted();
+
+        // Started with open seats and stale lobby_meta — must not register.
+        let mut drafting_mgr = DraftSessionManager::new();
+        let (draft_code, _host_token, _) =
+            drafting_mgr.create_draft(test_config(), "Alice".to_string());
+        drafting_mgr
+            .sessions
+            .get_mut(&draft_code)
+            .unwrap()
+            .lobby_meta = Some(meta);
+        drafting_mgr
+            .join_draft(&draft_code, "Bob".to_string(), Some("secret"))
+            .unwrap();
+        let source = draft_core::pack_source::FixturePackSource {
+            set_code: "TST".to_string(),
+            cards_per_pack: 14,
+        };
+        drafting_mgr
+            .apply_system_action(&draft_code, DraftAction::StartDraft, Some(&source))
+            .unwrap();
+        let mut drafting_ps = drafting_mgr.sessions[&draft_code].to_persisted();
+        drafting_ps.lobby_meta = Some(PersistedLobbyMeta {
+            host_name: "Alice".to_string(),
+            public: true,
+            password: Some("secret".to_string()),
+            timer_seconds: None,
+            start_when_full: true,
+            ranked: false,
+        });
+        assert_eq!(drafting_ps.session.status, DraftStatus::Drafting);
+        assert!(
+            drafting_ps
+                .player_tokens
+                .iter()
+                .filter(|t| !t.is_empty())
+                .count()
+                < 8,
+            "started draft should still have open seats"
+        );
+
+        register_restored_draft(&mut lob, &lobby_code, &lobby_ps, &env);
+        register_restored_draft(&mut lob, &draft_code, &drafting_ps, &env);
+
+        assert!(
+            lob.has_game(&lobby_code),
+            "lobby-status draft must re-register on restore"
+        );
+        assert!(
+            !lob.has_game(&draft_code),
+            "started draft with stale lobby_meta must not re-register"
+        );
     }
 
     #[test]
@@ -956,6 +1354,59 @@ mod tests {
         assert_eq!(mgr2.draft_for_token(&token), Some(code.as_str()));
     }
 
+    #[test]
+    fn restore_persisted_session_rejects_mismatched_wrapper_without_mutation() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, _token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+        let mut persisted = mgr.sessions[&code].to_persisted();
+        persisted.display_names.pop();
+
+        let mut restored = DraftSessionManager::new();
+        assert!(restored.restore_persisted_session(persisted).is_err());
+        assert!(restored.sessions.is_empty());
+    }
+
+    #[test]
+    fn restore_persisted_session_rejects_duplicate_player_tokens() {
+        let mut mgr = DraftSessionManager::new();
+        let (code, token, _) = mgr.create_draft(test_config(), "Alice".to_string());
+        let mut persisted = mgr.sessions[&code].to_persisted();
+        persisted.player_tokens[1] = token;
+
+        let mut restored = DraftSessionManager::new();
+        assert!(restored.restore_persisted_session(persisted).is_err());
+        assert!(restored.sessions.is_empty());
+    }
+
+    #[test]
+    fn restore_persisted_session_accepts_chaos_through_redacted_player_views() {
+        let mut source = DraftSessionManager::new();
+        let (code, token, _) = source.create_draft(test_config(), "Alice".to_string());
+        let mut persisted = source.sessions[&code].to_persisted();
+        let chaos_source = DraftSource::Set {
+            layout: draft_core::types::SetLayout::Chaos {
+                candidate_codes: vec!["TST".to_string()],
+                assignments: vec![vec!["TST".to_string(); 3]; 8],
+            },
+        };
+        persisted.config.source = chaos_source.clone();
+        persisted.session.config.source = chaos_source;
+
+        let mut restored = DraftSessionManager::new();
+        restored
+            .restore_persisted_session(persisted)
+            .expect("redacted core views make persisted Chaos sessions safe to restore");
+
+        let view = restored.sessions[&code].view_for_seat(0);
+        let serialized = serde_json::to_string(&view).expect("serialize player view");
+        assert!(
+            !serialized.contains("assignments"),
+            "a server player view must not serialize Chaos assignments: {serialized}"
+        );
+        assert!(restored.sessions.contains_key(&code));
+        assert_eq!(restored.draft_for_token(&token), Some(code.as_str()));
+    }
+
     fn fill_and_start(mgr: &mut DraftSessionManager, code: &str) {
         for i in 1..8 {
             mgr.join_draft(code, format!("Player {i}"), None).unwrap();
@@ -1034,7 +1485,7 @@ mod tests {
             2,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: "abc".to_string(),
+                card_instance_ids: vec!["abc".to_string()],
             },
         )
         .expect("seat-scoped action is allowed for any seat");
@@ -1042,18 +1493,47 @@ mod tests {
             action,
             DraftAction::Pick {
                 seat: 2,
-                card_instance_id: "abc".to_string()
+                card_instance_ids: vec!["abc".to_string()]
             }
         );
     }
 
     #[test]
-    fn authorize_rebinds_submit_deck_seat() {
+    fn authorize_rebinds_draft_effect_pick_seat_to_authenticated_seat() {
+        let action = authorize_client_draft_action(
+            2,
+            DraftAction::PickWithDraftEffect {
+                seat: 0,
+                effect_card_instance_id: "cogwork-1".to_string(),
+                card_instance_ids: vec!["card-1".to_string(), "card-2".to_string()],
+            },
+        )
+        .expect("seat-scoped action is allowed for any seat");
+        assert_eq!(
+            action,
+            DraftAction::PickWithDraftEffect {
+                seat: 2,
+                effect_card_instance_id: "cogwork-1".to_string(),
+                card_instance_ids: vec!["card-1".to_string(), "card-2".to_string()],
+            }
+        );
+    }
+
+    /// The seat is TABLE authority and is overwritten with the authenticated
+    /// one; the CR 903.3 designation is PLAYER data and must survive untouched.
+    ///
+    /// The second half is the discriminating assertion for this seam: a
+    /// reconstruction that dropped `commanders` (or reset it to `Vec::new()`)
+    /// would leave the server path silently unable to designate a commander at
+    /// all, while every draft-core test still passed.
+    #[test]
+    fn authorize_rebinds_submit_deck_seat_and_carries_the_designation() {
         let action = authorize_client_draft_action(
             3,
             DraftAction::SubmitDeck {
                 seat: 0,
                 main_deck: vec!["x".to_string()],
+                commanders: vec!["x".to_string()],
             },
         )
         .expect("submit deck is allowed for any seat");
@@ -1061,7 +1541,8 @@ mod tests {
             action,
             DraftAction::SubmitDeck {
                 seat: 3,
-                main_deck: vec!["x".to_string()]
+                main_deck: vec!["x".to_string()],
+                commanders: vec!["x".to_string()],
             }
         );
     }
@@ -1116,9 +1597,7 @@ mod tests {
         use engine::types::player::PlayerId;
 
         let config = DraftConfig {
-            source: DraftSource::Set {
-                code: "TST".to_string(),
-            },
+            source: DraftSource::single_set("TST".to_string()),
             set_code: "TST".to_string(),
             kind: DraftKind::Premier,
             pod_size: 2,
@@ -1152,7 +1631,7 @@ mod tests {
             &mut session,
             DraftAction::Pick {
                 seat: 0,
-                card_instance_id: card_id,
+                card_instance_ids: vec![card_id],
             },
             None,
         )

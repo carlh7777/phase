@@ -1,6 +1,6 @@
 ---
 name: ship-commits
-description: Use when shipping local commits to main via the merge queue. Creates an isolated worktree based on origin/main, cherry-picks the named commits into a fresh branch, pushes with --no-verify, opens a PR with `gh pr create --fill`, and enqueues with `gh pr merge --squash --auto`. Outbound counterpart to `pr-contribution-handler`. Use when the user says "ship this", "push to main", "send through the queue", "PR this work", or has finished a chunk of work and wants it on main.
+description: Use when shipping local commits to main via the merge queue. Creates an isolated worktree based on origin/main, cherry-picks the named commits into a fresh branch, pushes with --no-verify, opens a PR with `gh pr create --fill`, and enqueues with `gh pr merge --auto`. Outbound counterpart to `pr-contribution-handler`. Use when the user says "ship this", "push to main", "send through the queue", "PR this work", or has finished a chunk of work and wants it on main.
 ---
 
 # Ship Commits
@@ -25,7 +25,7 @@ A worktree based on `origin/main` gives a clean branch we cherry-pick into, isol
 
 ## When NOT to use
 
-- Work is uncommitted. Run `/commit` first (commit by pathspec — your memory's `feedback_shared_index_commit_pathspec`).
+- Work is uncommitted. Run `/commit` first (commit by pathspec — your memory's `feedback_shared_index_commit_pathspec`). **Uncommitted work being shipped must not be left dirty on local `main`.**
 - A PR for these commits already exists. Use `gh pr merge <N> --auto` directly to enqueue.
 - The commits are already on `origin/main`. Nothing to do.
 - Repo isn't `phase-rs/phase`. This skill encodes phase.rs-specific conventions.
@@ -34,7 +34,7 @@ A worktree based on `origin/main` gives a clean branch we cherry-pick into, isol
 
 | Convention | Why |
 |------------|-----|
-| **Squash-only merges.** `--squash` is mandatory; `--merge` and `--rebase` are server-disabled. | Repo keeps `main` as one-commit-per-feature. |
+| **The merge queue owns the merge strategy — do NOT pass `--squash`.** `gh pr merge --squash --auto` is rejected with `The merge strategy for main is set by the merge queue`. Pass `--auto` alone. The queue still produces a squash commit, which is why Step 0's reconciliation must stay squash-aware. | Repo keeps `main` as one-commit-per-feature, enforced queue-side rather than client-side. |
 | **`--auto` is mandatory on `gh pr merge`.** | Without it, the merge bypasses the queue and tries to merge immediately — fails on protected `main`. |
 | **`--no-verify` on push.** | Pre-push hooks duplicate validation that Tilt/CI has already done locally. CI/queue will re-validate. |
 | **Branch protection on `main` blocks direct push for non-admins.** | Queue handles serialization for parallel PRs. |
@@ -106,6 +106,45 @@ This only ever touches `ship/*` worktrees this skill created; `forge.rs-pr` and 
 ### 1. Identify the commits to ship
 
 If the user named commits explicitly (SHAs, "the last commit", "HEAD~3..HEAD"), use them. Otherwise, ask once: which commits?
+
+**Hard gate: do not ship uncommitted source changes by recreating them in the ship worktree.** If the work to ship currently exists as tracked modifications in local `main`, first commit that exact work in the source worktree by pathspec, then verify the shipped pathspecs are clean there before continuing. The source worktree may contain unrelated dirty files from other agents, but the files you are shipping must not remain dirty.
+
+Use this checklist before creating the ship worktree:
+
+**Use an array, and quote the expansion.** A space-separated *string* silently
+breaks every check below: this shell is zsh, which does not word-split unquoted
+parameters, so `git status --short -- $SHIPPED_PATHS` passes the whole string as
+**one** pathspec, matches nothing, and exits `0` with empty output — byte-identical
+to the "clean" result you are looking for. The paired `git add` fails loudly
+(`fatal: pathspec '…' did not match any files`), but the `git status` hygiene gate
+degrades to a warning and reports success for paths it never examined. A check
+that can only ever print nothing is not a check.
+
+```bash
+# 1) Identify the paths that belong to the work being shipped.
+#    ARRAY, not a string — see above.
+SHIPPED_PATHS=(path/one path/two)
+
+# 2) Positive control: every path must exist, or a clean result below is vacuous.
+#    This is what catches a typo, a stale path, or a mis-quoted expansion.
+for p in "${SHIPPED_PATHS[@]}"; do
+  [ -e "$p" ] || echo "MISSING PATHSPEC (fix before trusting any check): $p"
+done
+
+# 3) If any shipped path is dirty, commit it in the source worktree first.
+git status --short -- "${SHIPPED_PATHS[@]}"
+# If output is non-empty: run /commit, or stage exactly these paths and commit:
+#   git add -- "${SHIPPED_PATHS[@]}"
+#   git diff --cached --name-only   # verify the staged set is exactly what you expect
+#   git commit
+
+# 4) Re-check. This must print nothing before shipping.
+git status --short -- "${SHIPPED_PATHS[@]}"
+```
+
+If the re-check still shows shipped paths dirty, stop and fix that before shipping. Do not proceed with a PR while the same work remains as uncommitted local `main` changes. This prevents the user from seeing the work both "shipped" and still dirty locally.
+
+Generated planning/review artifacts are not part of the shipped code unless the user explicitly requested them. If you created untracked artifacts while preparing the shipment (`.claude/wf/*`, `.agents/pr-review/*`, compiler crash dumps, logs), either remove your own artifacts or explicitly report them and get approval before leaving them behind.
 
 Resolve to a concrete list of SHAs in chronological order (oldest first):
 
@@ -201,6 +240,14 @@ Do **not** reintroduce a SHA-equality reset here. A squash-merge changes the SHA
 
 If the commits were shipped from a feature branch (not `main`), leave that branch alone.
 
+Then verify source-worktree hygiene for the shipped paths recorded in Step 1:
+
+```bash
+git status --short -- "${SHIPPED_PATHS[@]}"   # array + quotes: see Step 1
+```
+
+This must print nothing for work that was originally uncommitted on local `main`. If it prints shipped paths, the shipment is incomplete operationally: either the work was not committed before shipping, or the source worktree still contains duplicate local modifications. Do not silently leave that state. Clean only files you own and only after confirming they are represented by the shipped commits; otherwise stop and report the exact dirty paths.
+
 ### 8. Worktree disposition
 
 Default: leave the worktree at `$WORKTREE` so the user can inspect it if the queue rejects the PR. It's gitignored at the repo level (worktrees live above the repo root). It will be **auto-pruned by Step 0 on the next ship-commits run** once its PR squash-merges (along with its build artifacts) — so you don't have to remember to clean it up. To remove it sooner: `git worktree remove "$WORKTREE"` once the PR lands.
@@ -231,6 +278,7 @@ For each shipped PR, report:
 - Commits included (SHA + subject, in cherry-pick order)
 - Enqueue status: `enqueued: yes` with timestamp, or `enqueued: no` with the exact `gh pr merge` error
 - Whether local `main` was reset (and why, or why not)
+- Source-worktree hygiene: whether the shipped pathspecs are clean on local `main`; list any remaining dirty shipped paths explicitly
 - Worktree disposition (left in place vs. removed)
 
 Do not claim "merged" — the queue is async. The correct status at end-of-skill is `enqueued`.

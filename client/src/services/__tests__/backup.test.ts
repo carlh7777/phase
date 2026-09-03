@@ -1,13 +1,98 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
-import { applyBackup, buildBackup, importBackupFromFile, type PhaseBackupV1 } from "../backup";
-import { DECK_FOLDERS_KEY, STORAGE_KEY_PREFIX } from "../../constants/storage";
+import {
+  applyBackup,
+  buildBackup,
+  importBackupFromFile,
+  mergeDeckCollections,
+  type PhaseBackupV1,
+} from "../backup";
+import {
+  DECK_FOLDERS_KEY,
+  DRAFT_WORKSPACE_PREFERENCES_KEY,
+  STORAGE_KEY_PREFIX,
+} from "../../constants/storage";
 
 beforeEach(() => {
   localStorage.clear();
 });
 
 const FOLDERS_JSON = JSON.stringify([{ id: "f1", name: "Control", order: 0 }]);
+
+const backupWithoutWorkspacePreferences = (): PhaseBackupV1 => ({
+  version: 1,
+  exportedAt: new Date(0).toISOString(),
+  preferences: null,
+  decks: {},
+  deckMetadata: null,
+  activeDeck: null,
+  feedSubscriptions: null,
+  feedDeckOrigins: null,
+});
+
+describe("backup — draft workspace preferences", () => {
+  it("round-trips valid noncanonical JSON bytes through V1 build and apply", () => {
+    const raw = `{ "schemaVersion" : 1, "explicitView" : null }\n`;
+    localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, raw);
+
+    const backup = buildBackup();
+    expect(backup.version).toBe(1);
+    expect(backup.draftWorkspacePreferences).toBe(raw);
+
+    localStorage.clear();
+    applyBackup(backup, "overwrite");
+    expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBe(raw);
+  });
+
+  it("preserves merge state and clears overwrite state when an old V1 omits the field", () => {
+    const raw = JSON.stringify({ schemaVersion: 1 });
+    const oldBackup = backupWithoutWorkspacePreferences();
+    localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, raw);
+
+    applyBackup(oldBackup, "merge");
+    expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBe(raw);
+
+    applyBackup(oldBackup, "overwrite");
+    expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY)).toBeNull();
+  });
+
+  it("keeps the local profile value when cloud merge input omits the field", () => {
+    const local = backupWithoutWorkspacePreferences();
+    local.draftWorkspacePreferences = JSON.stringify({ schemaVersion: 1, explicitView: "board" });
+    const merged = mergeDeckCollections(local, backupWithoutWorkspacePreferences());
+
+    expect(merged.draftWorkspacePreferences).toBe(local.draftWorkspacePreferences);
+  });
+
+  it.each(["merge", "overwrite"] as const)(
+    "reports malformed preferences without writing them in %s mode",
+    (mode) => {
+      const prior = JSON.stringify({ schemaVersion: 1 });
+      const backup = {
+        ...backupWithoutWorkspacePreferences(),
+        draftWorkspacePreferences: "{ malformed",
+      };
+      localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, prior);
+
+      const result = applyBackup(backup, mode);
+
+      expect(result.malformedKeys).toContain(DRAFT_WORKSPACE_PREFERENCES_KEY);
+      expect(localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY))
+        .toBe(mode === "merge" ? prior : null);
+    },
+  );
+
+  it("validates an old V1 file that omits the optional field", async () => {
+    const file = new File(
+      [JSON.stringify(backupWithoutWorkspacePreferences())],
+      "phase-backup.json",
+      { type: "application/json" },
+    );
+
+    const result = await importBackupFromFile(file, "merge");
+    expect(result.malformedKeys).toEqual([]);
+  });
+});
 
 describe("backup — deck folders", () => {
   it("round-trips the folder registry through build + apply", () => {
@@ -60,5 +145,83 @@ describe("backup — deck folders", () => {
 
     const result = await importBackupFromFile(file, "merge");
     expect(result.decksImported).toBe(1);
+  });
+});
+
+describe("mergeDeckCollections", () => {
+  const backup = (decks: Record<string, string>): PhaseBackupV1 => ({
+    version: 1,
+    exportedAt: new Date(0).toISOString(),
+    preferences: "local preferences",
+    decks,
+    deckMetadata: "local metadata",
+    deckFolders: "local folders",
+    activeDeck: "Local Deck",
+    feedSubscriptions: "local feeds",
+    feedDeckOrigins: "local origins",
+  });
+
+  it("keeps both conflicting decks with a unique cloud name", () => {
+    const merged = mergeDeckCollections(
+      backup({ Shared: "local", "Shared (Cloud)": "prior cloud copy" }),
+      backup({ Shared: "cloud", Remote: "remote" }),
+    );
+
+    expect(merged.decks).toEqual({
+      Shared: "local",
+      "Shared (Cloud)": "prior cloud copy",
+      "Shared (Cloud 2)": "cloud",
+      Remote: "remote",
+    });
+    expect(merged.preferences).toBe("local preferences");
+  });
+
+  it("deduplicates cloud decks whose contents already match", () => {
+    const merged = mergeDeckCollections(
+      backup({ Shared: "same" }),
+      backup({ Shared: "same" }),
+    );
+
+    expect(merged.decks).toEqual({ Shared: "same" });
+  });
+
+  it("keeps metadata, origins, and folders for renamed cloud decks", () => {
+    const local = backup({ Shared: "local" });
+    local.deckMetadata = JSON.stringify({ Shared: { addedAt: 1, folderId: "local-folder" } });
+    local.deckFolders = JSON.stringify([{ id: "local-folder", name: "Local", order: 0 }]);
+    local.feedDeckOrigins = JSON.stringify({ Shared: "local-feed" });
+    const cloud = backup({ Shared: "cloud" });
+    cloud.deckMetadata = JSON.stringify({ Shared: { addedAt: 2, starred: true, folderId: "cloud-folder" } });
+    cloud.deckFolders = JSON.stringify([{ id: "cloud-folder", name: "Cloud", order: 0 }]);
+    cloud.feedDeckOrigins = JSON.stringify({ Shared: "cloud-feed" });
+
+    const merged = mergeDeckCollections(local, cloud);
+
+    expect(JSON.parse(merged.deckMetadata ?? "{}")).toMatchObject({
+      Shared: { folderId: "local-folder" },
+      "Shared (Cloud)": { folderId: "cloud-folder", starred: true },
+    });
+    expect(JSON.parse(merged.feedDeckOrigins ?? "{}")).toMatchObject({
+      Shared: "local-feed",
+      "Shared (Cloud)": "cloud-feed",
+    });
+    expect(JSON.parse(merged.deckFolders ?? "[]")).toEqual([
+      { id: "local-folder", name: "Local", order: 0 },
+      { id: "cloud-folder", name: "Cloud", order: 0 },
+    ]);
+  });
+
+  it("does not merge malformed cloud folder or deck metadata entries", () => {
+    const local = backup({ Local: "local" });
+    local.deckMetadata = JSON.stringify({ Local: { addedAt: 1 } });
+    local.deckFolders = JSON.stringify([{ id: "local-folder", name: "Local", order: 0 }]);
+    const cloud = backup({ Remote: "remote" });
+    cloud.deckMetadata = JSON.stringify({ Remote: null });
+    cloud.deckFolders = JSON.stringify([{ id: 42, name: "Invalid", order: 0 }]);
+
+    const merged = mergeDeckCollections(local, cloud);
+
+    expect(merged.deckMetadata).toBe(local.deckMetadata);
+    expect(merged.deckFolders).toBe(local.deckFolders);
   });
 });

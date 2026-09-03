@@ -1,19 +1,23 @@
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::game_object::GameObject;
 use engine::types::ability::{
-    ContinuousModification, Effect, EffectScope, PtValue, QuantityExpr, TapStateChange,
-    TargetFilter, TypeFilter,
+    ContinuousModification, ControllerRef, Effect, EffectScope, PtValue, QuantityExpr,
+    TapStateChange, TargetFilter, TriggerDefinition, TypeFilter,
 };
 use engine::types::counter::CounterType;
 use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
-use engine::types::keywords::Keyword;
+use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::player::PlayerId;
 use engine::types::statics::StaticMode;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
 use super::context::PolicyContext;
+
+/// Player-impact magnitude above which target selection has a directional
+/// preference rather than falling back to the spell's broader polarity.
+pub(crate) const PLAYER_IMPACT_PREFERENCE_BAND: f64 = 0.25;
 
 /// Three-valued polarity: whether an effect benefits or harms its target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,30 +39,96 @@ fn invert(polarity: EffectPolarity) -> EffectPolarity {
     }
 }
 
-/// CR 122.1: Counters sign — `+1/+1` is beneficial to the bearer, `-1/-1`
-/// harmful. Non-P/T counter types (poison, loyalty, charge, etc.) are classified
-/// as Contextual because their value to the bearer depends on card semantics.
+/// CR 122.1: A counter's polarity for the permanent that bears it.
+///
+/// Exhaustive over `CounterType` — deliberately no wildcard — so a new counter
+/// kind is a compile error here rather than a silent `Contextual`. `Contextual`
+/// reads as impact 0.0 at the call sites, which inverts the AI's target
+/// preference (it happily shielded and buffed opponents' creatures).
 fn counter_sign_polarity(counter_type: &CounterType) -> EffectPolarity {
     match counter_type {
+        // CR 122.1a: `+X/+Y` adds to power and toughness, `-X/-Y` subtracts.
         CounterType::Plus1Plus1 => EffectPolarity::Beneficial,
         CounterType::Minus1Minus1 => EffectPolarity::Harmful,
+        // CR 122.1a: the parameterized asymmetric counter carries both deltas,
+        // so the sign is derived rather than assumed. A mixed counter (+1/-1)
+        // is a genuine trade-off and an all-zero one a no-op, so both stay
+        // Contextual.
+        CounterType::PowerToughness { power, toughness } => match (*power, *toughness) {
+            (0, 0) => EffectPolarity::Contextual,
+            (p, t) if p >= 0 && t >= 0 => EffectPolarity::Beneficial,
+            (p, t) if p <= 0 && t <= 0 => EffectPolarity::Harmful,
+            _ => EffectPolarity::Contextual,
+        },
+        // CR 122.1c: shield counters only ever protect their bearer — they
+        // replace a destruction and prevent damage — so they are strictly
+        // beneficial to it.
+        CounterType::Shield => EffectPolarity::Beneficial,
+        // CR 122.1d: a stun counter stops the permanent from untapping, a
+        // strict penalty on its controller.
+        CounterType::Stun => EffectPolarity::Harmful,
+        // CR 702.147a: decayed is the one keyword a counter can grant that is a
+        // drawback ("can't block", and sacrifice at end of combat when it
+        // attacks), so it inverts the keyword-counter default below.
+        CounterType::Keyword(KeywordKind::Decayed) => EffectPolarity::Harmful,
+        // CR 122.1b: every other keyword a counter can grant (flying, first
+        // strike, hexproof, lifelink, …) upgrades the bearer.
+        CounterType::Keyword(_) => EffectPolarity::Beneficial,
+        // Resource and clock counters carry no intrinsic polarity for the
+        // bearer: CR 122.1e loyalty is a planeswalker's own currency;
+        // CR 122.1g defense is a battle's, and a battle is attacked by its
+        // protector's opponents; CR 714.3 lore advances a Saga toward both its
+        // payoff chapters and its sacrifice; CR 702.62a/CR 702.63a time counts
+        // down to a free cast (suspend) or a sacrifice (vanishing);
+        // CR 702.32a fade and CR 702.24a age each bring the sacrifice or the
+        // escalating upkeep closer on a permanent that was printed to carry
+        // them; CR 122.1h finality swaps the graveyard for exile, which denies
+        // the bearer's controller recursion but also denies an opponent's.
+        CounterType::Loyalty
+        | CounterType::Defense
+        | CounterType::Lore
+        | CounterType::Time
+        | CounterType::Fade
+        | CounterType::Age
+        | CounterType::Finality => EffectPolarity::Contextual,
+        // The legacy string counter keeps its `+`/`-` spelling rule; every
+        // other name (charge, quest, verse, …) is card-specific.
         CounterType::Generic(s) if s.starts_with('+') => EffectPolarity::Beneficial,
         CounterType::Generic(s) if s.starts_with('-') => EffectPolarity::Harmful,
-        _ => EffectPolarity::Contextual,
+        CounterType::Generic(_) => EffectPolarity::Contextual,
+    }
+}
+
+/// Whether a `Pump` power/toughness modifier is non-negative.
+///
+/// The parser carries a pump's sign *inside* the value, in two encodings the AI
+/// must read alike:
+/// - `PtValue::Variable` names the signed variable directly — "target creature
+///   gets -X/-X" parses to `Variable("-X")` (Slice from the Shadows), while
+///   "gets +X/+X" parses to `Variable("X")`.
+/// - `PtValue::Quantity` negates by multiplying — "gets -X/-X, where X is the
+///   number of …" parses to `Multiply { factor: -1, inner }`.
+///
+/// Every other `Quantity` shape counts up from a non-negative game quantity, and
+/// a `Fixed` modifier carries its own sign.
+fn pt_value_is_non_negative(value: &PtValue) -> bool {
+    match value {
+        PtValue::Fixed(v) => *v >= 0,
+        PtValue::Variable(name) => !name.starts_with('-'),
+        PtValue::Quantity(QuantityExpr::Multiply { factor, .. }) => *factor >= 0,
+        PtValue::Quantity(_) => true,
     }
 }
 
 pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
     match effect {
-        // Pump: beneficial only if both values are non-negative
+        // Pump: beneficial only if both modifiers are non-negative. The sign
+        // lives in the value (see `pt_value_is_non_negative`), so a `-X/-X`
+        // shrink must not be read as a buff just because it is variable.
         Effect::Pump {
             power, toughness, ..
         } => {
-            let p_ok = matches!(power, PtValue::Fixed(v) if *v >= 0)
-                || matches!(power, PtValue::Variable(_) | PtValue::Quantity(_));
-            let t_ok = matches!(toughness, PtValue::Fixed(v) if *v >= 0)
-                || matches!(toughness, PtValue::Variable(_) | PtValue::Quantity(_));
-            if p_ok && t_ok {
+            if pt_value_is_non_negative(power) && pt_value_is_non_negative(toughness) {
                 EffectPolarity::Beneficial
             } else {
                 EffectPolarity::Harmful
@@ -72,6 +142,16 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         Effect::PutCounter { counter_type, .. } | Effect::PutCounterAll { counter_type, .. } => {
             counter_sign_polarity(counter_type)
         }
+        // CR 122.1: the reproduced counter KIND is event-derived at resolution —
+        // there is no static `counter_type` to sign, and the triggering event can
+        // carry a harmful kind (e.g. -1/-1). The `target` is also not necessarily
+        // self: Aragorn, Company Leader reproduces onto "up to one OTHER target
+        // creature", so the effect can land on a creature the controller does not
+        // want buffed/debuffed. Neither the sign nor the recipient is knowable
+        // until the policy holds the selected target and the triggering multiset,
+        // so classify as Contextual and let the call site (e.g. anti_self_harm)
+        // inspect both rather than assuming a self-buff.
+        Effect::ReproduceEventCounters { .. } => EffectPolarity::Contextual,
         // CR 122.1 + CR 121: Removing counters inverts the placement polarity —
         // removing a +1/+1 counter harms the bearer, removing a -1/-1 counter
         // helps it (Hexcaster's Mark, Solemnity-style interactions, Vampire
@@ -129,13 +209,21 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::Draw { .. }
         | Effect::Token { .. }
         | Effect::Scry { .. }
+        | Effect::ArrangePlanarDeckTop { .. }
         | Effect::Explore
         | Effect::Investigate
         | Effect::Mana { .. }
         | Effect::SearchLibrary { .. }
         | Effect::Surveil { .. }
         | Effect::Connive { .. }
-        | Effect::BecomeMonarch
+        // CR 725.1 + CR 725.2: the monarch draws an extra card each turn, so
+        // crowning YOURSELF is beneficial. Crowning someone else ("target
+        // opponent becomes the monarch") hands that advantage away and is NOT,
+        // so every other subject scope falls through to the `Contextual`
+        // catch-all rather than inheriting this arm.
+        | Effect::BecomeMonarch {
+            target: TargetFilter::Controller,
+        }
         | Effect::ExtraTurn { .. } => EffectPolarity::Beneficial,
         // CR 701.26a: tapping a single permanent is harmful (denies its use).
         // The mass (`All`) scope is left Contextual via the catch-all, matching
@@ -196,7 +284,204 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::GivePlayerCounter { .. }
         | Effect::ExchangeControl { .. }
         | Effect::ExchangeLifeTotals { .. } => EffectPolarity::Contextual,
-        _ => EffectPolarity::Contextual,
+        // Remaining variants have no fixed polarity for target-selection purposes
+        // (their benefit/harm depends on usage context). Enumerated exhaustively
+        // rather than caught by `_` so a newly added `Effect` variant fails to
+        // compile here until its polarity is deliberately classified — the
+        // forcing function that prevents silent `Contextual` misclassification.
+        // `SetTapState { .. }` here catches only the non-Single scopes; the
+        // beneficial (Single+Untap) and harmful (Single+Tap) cases are handled
+        // by the guarded arms above.
+        Effect::Adapt { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddPendingEntersModifications { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::Amass { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::Attach { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::Behold { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Bolster { .. }
+        | Effect::Cascade
+        | Effect::CastCopyOfCard { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::ChaosEnsues
+        | Effect::Choose { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::ChooseCounterAdjustment { .. }
+        | Effect::ChooseCounterKind { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::ChoosePermanent { .. }
+        | Effect::Clash
+        | Effect::Cleanup { .. }
+        | Effect::Cloak { .. }
+        | Effect::CollectEvidence { .. }
+        | Effect::CombineHost { .. }
+        | Effect::Conjure { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::CopySpell { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CounterAll { .. }
+        | Effect::CrankContraptions { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::CreatePlaneswalkReplacement { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::Detain { .. }
+        | Effect::Dig { .. }
+        | Effect::Discard { .. }
+        | Effect::Discover { .. }
+        | Effect::Double { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::EachPlayerCopyChosen { .. }
+        | Effect::EachSourceDealsDamage { .. }
+        | Effect::Encore
+        | Effect::EndCombatPhase
+        | Effect::EndTheTurn
+        | Effect::Endure { .. }
+        | Effect::EpicCopy { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        | Effect::ExileTop { .. }
+        | Effect::ExileFaceDownPile { .. }
+        | Effect::Exploit { .. }
+        | Effect::ExploreAll { .. }
+        | Effect::FlipCoin { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::Forage
+        | Effect::CompletePlayerAction { .. }
+        | Effect::ForceAttack { .. }
+        | Effect::ForEachCategory { .. }
+        | Effect::FreeCastFromZones { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GiveControl { .. }
+        | Effect::GoadAll { .. }
+        | Effect::GrantCastingPermission { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::Harness
+        | Effect::Heist { .. }
+        | Effect::HeistExile
+        | Effect::HideawayConceal { .. }
+        | Effect::Incubate { .. }
+        | Effect::Intensify { .. }
+        | Effect::Learn
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Meld { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Myriad
+        | Effect::NoOp
+        | Effect::NoteManaSpent
+        | Effect::OpenAttractions { .. }
+        | Effect::OpponentGuess { .. }
+        | Effect::PairWith { .. }
+        | Effect::PayCost { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::Planeswalk
+        | Effect::Populate
+        | Effect::ProcessRadCounters
+        | Effect::ProliferateTarget { .. }
+        | Effect::PumpAll { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::PutChosenCounter { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::RedistributeLifeTotals
+        | Effect::RegisterBending { .. }
+        | Effect::RememberCard { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::BecomeBlocked { .. }
+        // CR 725.1: crowning a player OTHER than yourself ("target opponent
+        // becomes the monarch"). Whether handing out the designation helps you
+        // is card-specific — Jared Carthalion wants an opponent crowned so it
+        // can take it back — so it is Contextual, never the `Beneficial` arm
+        // above, which is scoped to `PlayerScope::Controller`.
+        | Effect::BecomeMonarch { .. }
+        | Effect::Renown { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::Reveal { .. }
+        // CR 101.4: publishing already-chosen numbers moves no card and changes
+        // no board state, so it is neither good nor bad on its own — the damage
+        // and wheel clauses that READ those numbers carry the polarity.
+        | Effect::RevealChosenNumbers { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealTop { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::ReverseTurnOrder
+        | Effect::RingTemptsYou
+        | Effect::Ripple { .. }
+        | Effect::RollDie { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::RuntimeHandled { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::Seek { .. }
+        | Effect::SeparateIntoPiles { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::SetTapState { .. }
+        | Effect::Shuffle { .. }
+        | Effect::SolveCase
+        | Effect::Specialize
+        | Effect::StartYourEngines { .. }
+        | Effect::SwapChosenLabels { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::TakeTheInitiative
+        | Effect::TargetOnly { .. }
+        | Effect::TimeTravel
+        | Effect::Transform { .. }
+        // CR 710.4: like Transform, flipping swaps a permanent's characteristics
+        // wholesale — whether the alternative half is better is card-specific.
+        | Effect::FlipPermanent { .. }
+        | Effect::Tribute { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Unimplemented { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::VentureInto { .. }
+        | Effect::VentureIntoDungeon
+        | Effect::Vote { .. }
+        | Effect::WinTheGame { .. } => EffectPolarity::Contextual,
     }
 }
 
@@ -404,10 +689,10 @@ pub(crate) fn is_spell_beneficial(ctx: &PolicyContext<'_>) -> bool {
     }
 
     let player_impact = aggregate_player_impact(ctx);
-    if player_impact > 0.25 {
+    if player_impact > PLAYER_IMPACT_PREFERENCE_BAND {
         return true;
     }
-    if player_impact < -0.25 {
+    if player_impact < -PLAYER_IMPACT_PREFERENCE_BAND {
         return false;
     }
 
@@ -444,33 +729,75 @@ pub(crate) fn is_spell_beneficial(ctx: &PolicyContext<'_>) -> bool {
 }
 
 pub(crate) fn aggregate_player_impact(ctx: &PolicyContext<'_>) -> f64 {
-    ctx.effects()
-        .iter()
-        .map(|effect| player_impact(effect))
-        .sum()
+    aggregate_player_impact_in(&ctx.effects())
+}
+
+pub(crate) fn aggregate_player_impact_in(effects: &[&Effect]) -> f64 {
+    effects.iter().map(|effect| player_impact(effect)).sum()
 }
 
 pub(crate) fn targeted_player_impact(ctx: &PolicyContext<'_>, player: PlayerId) -> Option<f64> {
-    let source_controller = ctx.source_object().map(|object| object.controller);
+    let source = ctx.source_object();
+    targeted_player_impact_in(
+        ctx.state,
+        source.map(|object| object.controller),
+        source.map(|object| object.id),
+        &ctx.effects(),
+        player,
+    )
+}
+
+pub(crate) fn targeted_player_impact_in(
+    state: &GameState,
+    source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
+    effects: &[&Effect],
+    player: PlayerId,
+) -> Option<f64> {
     let mut found_targeted_effect = false;
     let mut impact = 0.0;
 
-    for effect in ctx.effects() {
+    for effect in effects {
         let Some(filter) = extract_target_filter(effect) else {
             continue;
         };
-        if engine::game::filter::player_matches_target_filter_in_state(
-            ctx.state,
-            filter,
-            player,
-            source_controller,
-        ) {
+        if filter_names_the_chosen_players_permanents(filter)
+            || engine::game::filter::player_matches_target_filter_in_state(
+                state,
+                filter,
+                player,
+                source_controller,
+                source_id,
+            )
+        {
             found_targeted_effect = true;
             impact += player_impact(effect);
         }
     }
 
     found_targeted_effect.then_some(impact)
+}
+
+/// "each creature target player controls" (Requisition
+/// Raid) or "each creature target opponent controls" has exactly one instance
+/// of the word "target", and it names a PLAYER. The objects the effect touches
+/// are described *by reference to* that chosen player, so the slot being
+/// filled is the player slot and the effect's impact lands on whichever player
+/// is chosen. `player_matches_target_filter_in_state` deliberately fails closed
+/// on both `ControllerRef::TargetPlayer` and `ControllerRef::TargetOpponent`
+/// (it has no ability context to resolve the reference against); here the
+/// candidate player *is* that target, so the effect must be counted for them
+/// rather than dropped — dropping it left the whole spell reading as "no
+/// per-player signal".
+fn filter_names_the_chosen_players_permanents(filter: &TargetFilter) -> bool {
+    matches!(
+        filter,
+        TargetFilter::Typed(typed)
+            if matches!(
+                typed.controller,
+                Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent)
+            )
+    )
 }
 
 pub(crate) fn targeted_object_impact(ctx: &PolicyContext<'_>, object_id: ObjectId) -> Option<f64> {
@@ -591,7 +918,11 @@ pub(crate) fn aura_polarity(source: &GameObject) -> EffectPolarity {
     // gifting one to an opponent is a strict negative for itself. A
     // `TapsForMana` trigger that adds mana is unambiguously beneficial to
     // the host's controller.
-    for trigger in source.trigger_definitions.iter_unchecked() {
+    for trigger in source
+        .trigger_definitions
+        .iter_unchecked()
+        .map(|entry| &entry.definition)
+    {
         match trigger_mode_polarity_for_host(trigger) {
             EffectPolarity::Contextual => continue,
             polarity => return polarity,
@@ -647,6 +978,23 @@ pub(crate) fn static_mode_polarity(mode: &StaticMode) -> EffectPolarity {
     }
 }
 
+/// CR 603.1: A `GrantTrigger` confers a triggered ability on its target. The
+/// benefit/harm to the bearer is the polarity of the effect that granted trigger
+/// *executes* — Undying Malice grants "when this dies, return it to the
+/// battlefield" (`ChangeZone`→Battlefield, Beneficial); a downside grant of "at
+/// the beginning of your upkeep, you lose 1 life" (`LoseLife`, Harmful) must NOT
+/// read Beneficial. Delegating to `effect_polarity` covers the whole class of
+/// grant-a-trigger buffs and downside curses (AI heuristic). The polarity is
+/// bound statically from the parsed `TriggerDefinition.execute.effect`; no live
+/// game-state lookup.
+fn granted_trigger_polarity(trigger: &TriggerDefinition) -> EffectPolarity {
+    trigger
+        .execute
+        .as_deref()
+        .map(|exec| effect_polarity(&exec.effect))
+        .unwrap_or(EffectPolarity::Contextual)
+}
+
 /// Classify a continuous modification as beneficial/harmful to its target.
 pub(crate) fn modification_polarity(m: &ContinuousModification) -> EffectPolarity {
     match m {
@@ -663,11 +1011,13 @@ pub(crate) fn modification_polarity(m: &ContinuousModification) -> EffectPolarit
         ContinuousModification::AddDynamicPower { .. }
         | ContinuousModification::AddDynamicToughness { .. } => EffectPolarity::Beneficial,
         ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::AddAllCreatureTypes
         | ContinuousModification::AddColor { .. }
         | ContinuousModification::AddType { .. }
         | ContinuousModification::AddSubtype { .. } => EffectPolarity::Beneficial,
+        ContinuousModification::GrantTrigger { trigger } => granted_trigger_polarity(trigger),
         ContinuousModification::RemoveKeyword { .. }
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::RemoveType { .. }
@@ -715,6 +1065,7 @@ mod lethality_tests {
             amount: QuantityExpr::Fixed { value },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         }
     }
 
@@ -909,6 +1260,355 @@ mod suspect_scope_tests {
         assert!(
             extract_target_filter(&all_unsuspect).is_none(),
             "mass Unsuspect{{All}} (Absolving Lammasu) is a population effect, not target-filtered"
+        );
+    }
+}
+
+#[cfg(test)]
+mod grant_trigger_polarity_tests {
+    use super::*;
+    use engine::types::ability::{AbilityDefinition, AbilityKind, StaticDefinition, TypedFilter};
+    use engine::types::zones::EtbTapState;
+
+    /// Build a `GenericEffect` that grants its target a triggered ability whose
+    /// executed effect is `exec` — the Undying-Malice-shaped AST
+    /// (`GenericEffect{ Continuous{ GrantTrigger{ dies → exec } } }`).
+    fn grant_trigger_generic(exec: Effect) -> Effect {
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.execute = Some(Box::new(AbilityDefinition::new(AbilityKind::Spell, exec)));
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::GrantTrigger {
+                    trigger: Box::new(trigger),
+                }])],
+            target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature))),
+            duration: None,
+            end_cost: None,
+        }
+    }
+
+    /// "When this dies, return it to the battlefield" — the Undying Malice grant.
+    fn return_to_battlefield() -> Effect {
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::SelfRef,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        }
+    }
+
+    #[test]
+    fn grant_return_trigger_reads_beneficial() {
+        // Undying Malice grants "when this dies, return it to the battlefield"
+        // (ChangeZone→Battlefield, Beneficial). Pre-fix `GrantTrigger` hit the
+        // `_ => Contextual` fallback, so the whole GenericEffect read Contextual.
+        let ge = grant_trigger_generic(return_to_battlefield());
+        assert_eq!(effect_polarity(&ge), EffectPolarity::Beneficial);
+    }
+
+    #[test]
+    fn harmful_grant_trigger_not_beneficial() {
+        // A downside grant ("at the beginning of your upkeep, you lose 1 life")
+        // must read Harmful, NOT a blanket Beneficial — this is the load-bearing
+        // discriminator that proves the arm reads the executed-effect polarity
+        // rather than labeling every grant beneficial.
+        let ge = grant_trigger_generic(Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: None,
+        });
+        assert_eq!(effect_polarity(&ge), EffectPolarity::Harmful);
+    }
+
+    #[test]
+    fn granted_trigger_without_execute_is_contextual() {
+        // A grant whose trigger has no executed effect carries no polarity
+        // signal — stays Contextual (the same as the pre-existing fallback).
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.execute = None;
+        assert_eq!(
+            modification_polarity(&ContinuousModification::GrantTrigger {
+                trigger: Box::new(trigger),
+            }),
+            EffectPolarity::Contextual
+        );
+    }
+
+    #[test]
+    fn parsed_undying_malice_grant_reads_beneficial() {
+        // Production-parser reach guard: the real Undying Malice Oracle text parses
+        // to `GenericEffect{ Continuous{ GrantTrigger{ dies → ChangeZone→Battlefield
+        // } } }`, so its polarity must read Beneficial through the same classifier
+        // the AI target-scorer uses. Guards the fix against future parser AST drift.
+        use engine::parser::oracle::parse_oracle_text;
+
+        let parsed = parse_oracle_text(
+            "Until end of turn, target creature gains \"When this creature dies, return it to the battlefield tapped under its owner's control with a +1/+1 counter on it.\"",
+            "Undying Malice",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let spell = parsed
+            .abilities
+            .iter()
+            .find(|a| a.kind == AbilityKind::Spell)
+            .expect("Undying Malice parses to a spell ability");
+        assert_eq!(
+            effect_polarity(&spell.effect),
+            EffectPolarity::Beneficial,
+            "Undying Malice's granted return-to-battlefield trigger must read Beneficial"
+        );
+    }
+
+    #[test]
+    fn grant_ability_still_beneficial() {
+        // Sibling reach-guard: `GrantAbility` (a granted static/activated ability,
+        // no executed-trigger effect to inspect) stays in the Beneficial cluster,
+        // unchanged by the new GrantTrigger arm.
+        assert_eq!(
+            modification_polarity(&ContinuousModification::GrantAbility {
+                definition: Box::new(AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::TargetOnly {
+                        target: TargetFilter::Any,
+                    },
+                )),
+            }),
+            EffectPolarity::Beneficial
+        );
+    }
+}
+
+#[cfg(test)]
+mod pump_polarity_tests {
+    use super::*;
+    use engine::parser::oracle::parse_oracle_text;
+    use engine::types::ability::AbilityKind;
+
+    fn pump(power: PtValue, toughness: PtValue) -> Effect {
+        Effect::Pump {
+            power,
+            toughness,
+            target: TargetFilter::Any,
+        }
+    }
+
+    /// "gets -X/-X" — the parser puts the sign in the VARIABLE NAME, so the
+    /// pre-fix `matches!(PtValue::Variable(_))` non-negative assumption read it
+    /// as a buff and `anti_self_harm` aimed it at the AI's own creature.
+    #[test]
+    fn negative_variable_pump_is_harmful() {
+        assert_eq!(
+            effect_polarity(&pump(
+                PtValue::Variable("-X".to_string()),
+                PtValue::Variable("-X".to_string()),
+            )),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// The discriminator: the same variable carrier WITHOUT the sign is still a
+    /// buff, so the fix reads the name rather than blanket-condemning variables.
+    #[test]
+    fn positive_variable_pump_is_beneficial() {
+        assert_eq!(
+            effect_polarity(&pump(
+                PtValue::Variable("X".to_string()),
+                PtValue::Variable("X".to_string()),
+            )),
+            EffectPolarity::Beneficial
+        );
+    }
+
+    /// A single negative slot is enough: "+2/-2" harms the creature it lands on.
+    #[test]
+    fn one_negative_slot_makes_the_pump_harmful() {
+        assert_eq!(
+            effect_polarity(&pump(
+                PtValue::Fixed(2),
+                PtValue::Variable("-X".to_string()),
+            )),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// The parser's SECOND negative encoding: "gets -X/-X, where X is the number
+    /// of …" lands as `Quantity(Multiply { factor: -1, .. })`, not as a signed
+    /// variable name. 103 Pump/PumpAll slots in card-data carry a `Multiply`.
+    #[test]
+    fn where_x_negative_quantity_pump_is_harmful() {
+        let negated = PtValue::Quantity(QuantityExpr::Multiply {
+            factor: -1,
+            inner: Box::new(QuantityExpr::Ref {
+                qty: engine::types::ability::QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            }),
+        });
+        assert_eq!(
+            effect_polarity(&pump(negated.clone(), negated)),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// Sibling reach-guard: a POSITIVE multiplier ("twice the number of …") is
+    /// still a buff, so the arm keys on the factor's sign, not on `Multiply`.
+    #[test]
+    fn positive_multiply_quantity_pump_is_beneficial() {
+        let doubled = PtValue::Quantity(QuantityExpr::Multiply {
+            factor: 2,
+            inner: Box::new(QuantityExpr::Ref {
+                qty: engine::types::ability::QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            }),
+        });
+        assert_eq!(
+            effect_polarity(&pump(doubled.clone(), doubled)),
+            EffectPolarity::Beneficial
+        );
+    }
+
+    /// Production-parser reach guard: Slice from the Shadows' real Oracle text
+    /// parses to `Pump { power: Variable("-X"), toughness: Variable("-X") }`
+    /// (confirmed against `data/card-data.json`), and that shape must read
+    /// Harmful through the classifier the AI's target scorer uses.
+    #[test]
+    fn slice_from_the_shadows_real_parse_is_harmful() {
+        let parsed = parse_oracle_text(
+            "Target creature gets -X/-X until end of turn.",
+            "Slice from the Shadows",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let spell = parsed
+            .abilities
+            .iter()
+            .find(|a| a.kind == AbilityKind::Spell)
+            .expect("Slice from the Shadows parses to a spell ability");
+        assert!(
+            matches!(
+                &*spell.effect,
+                Effect::Pump { power: PtValue::Variable(p), toughness: PtValue::Variable(t), .. }
+                    if p == "-X" && t == "-X"
+            ),
+            "the sign lives in the variable name: {:?}",
+            spell.effect
+        );
+        assert_eq!(effect_polarity(&spell.effect), EffectPolarity::Harmful);
+    }
+}
+
+#[cfg(test)]
+mod counter_polarity_tests {
+    use super::*;
+    use engine::types::keywords::KeywordKind;
+
+    fn put(counter_type: CounterType) -> Effect {
+        Effect::PutCounter {
+            counter_type,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Any,
+        }
+    }
+
+    /// CR 122.1c: shield counters only ever protect their bearer. Pre-fix these
+    /// fell through the wildcard to `Contextual` (impact 0.0), so the AI put
+    /// them on opponents' creatures.
+    #[test]
+    fn shield_counter_is_beneficial() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::Shield)),
+            EffectPolarity::Beneficial
+        );
+    }
+
+    /// CR 122.1d: a stun counter stops the permanent from untapping.
+    #[test]
+    fn stun_counter_is_harmful() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::Stun)),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// CR 122.1b: a granted keyword upgrades the bearer …
+    #[test]
+    fn keyword_counter_is_beneficial() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::Keyword(KeywordKind::Flying))),
+            EffectPolarity::Beneficial
+        );
+    }
+
+    /// … except CR 702.147a decayed, the one drawback keyword a counter grants.
+    #[test]
+    fn decayed_keyword_counter_is_harmful() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::Keyword(KeywordKind::Decayed))),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// CR 122.1a: the asymmetric counter's sign comes from its own payload.
+    #[test]
+    fn power_toughness_counter_sign_derived() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::PowerToughness {
+                power: 1,
+                toughness: 0,
+            })),
+            EffectPolarity::Beneficial
+        );
+        assert_eq!(
+            effect_polarity(&put(CounterType::PowerToughness {
+                power: 0,
+                toughness: -1,
+            })),
+            EffectPolarity::Harmful
+        );
+        // Mixed signs are a trade-off, not a direction.
+        assert_eq!(
+            effect_polarity(&put(CounterType::PowerToughness {
+                power: 1,
+                toughness: -1,
+            })),
+            EffectPolarity::Contextual
+        );
+    }
+
+    /// Removing a counter inverts its polarity, and the inversion now reaches
+    /// the newly-signed kinds too (Vampire Hexmage on a shield counter).
+    #[test]
+    fn removing_a_shield_counter_is_harmful() {
+        assert_eq!(
+            effect_polarity(&Effect::RemoveCounter {
+                counter_type: Some(CounterType::Shield),
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            }),
+            EffectPolarity::Harmful
+        );
+    }
+
+    /// Unchanged behaviour guard: loyalty stays Contextual, so the exhaustive
+    /// match did not turn the whole enum into a direction.
+    #[test]
+    fn loyalty_counter_stays_contextual() {
+        assert_eq!(
+            effect_polarity(&put(CounterType::Loyalty)),
+            EffectPolarity::Contextual
         );
     }
 }

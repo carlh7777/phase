@@ -64,6 +64,11 @@ fn ninja_pump_static() -> StaticDefinition {
         characteristic_defining: false,
         description: None,
         attack_defended: None,
+        source_controller: None,
+        source_object: None,
+        bypass_beneficiary: None,
+        protection_does_not_remove: None,
+        room_door: None,
     }
 }
 

@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -10,7 +11,7 @@ use super::mtgjson::Ruling;
 use crate::types::card::{CardFace, CardRules, LayoutKind, PrintedCardRef};
 use crate::types::card_type::CoreType;
 
-use std::io::BufReader;
+use std::io::{BufReader, Read};
 
 #[derive(Default)]
 pub struct CardDatabase {
@@ -18,6 +19,14 @@ pub struct CardDatabase {
     pub(crate) face_index: HashMap<String, CardFace>,
     pub(crate) name_alias_index: HashMap<String, String>,
     pub(crate) oracle_id_index: HashMap<String, Vec<String>>,
+    /// Maps face key (lowercased card name) to its original zero-based position
+    /// inside MTGJSON's multi-face record. Export loading flattens faces into a
+    /// JSON object, whose iteration order is not a rules authority.
+    pub(crate) face_order_index: HashMap<String, usize>,
+    /// Deterministic card-search scan order. Built once by database loaders so
+    /// interactive search does not allocate and sort the full face index on
+    /// every query.
+    pub(crate) search_face_keys: Vec<String>,
     /// Maps oracle_id → runtime LayoutKind for multi-face cards.
     /// Populated only from the export path (the MTGJSON path uses `cards` directly).
     /// Enables `rehydrate_game_from_card_db` to determine the correct layout kind
@@ -63,7 +72,15 @@ impl CardDatabase {
     pub fn from_export(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let file = std::fs::File::open(path)?;
         let reader = BufReader::new(file);
-        let entries: HashMap<String, CardExportEntry> = serde_json::from_reader(reader)?;
+        Self::from_export_reader(reader)
+    }
+
+    /// Load a pre-processed card-data export from an already-open reader.
+    /// Keeps compressed test fixtures on the same deserialization path as the
+    /// production file loader without changing production's buffered-file flow.
+    pub fn from_export_reader<R: Read>(reader: R) -> Result<Self, Box<dyn std::error::Error>> {
+        let entries: HashMap<String, CardExportEntry> =
+            serde_json::from_reader(BufReader::new(reader))?;
         Ok(Self::from_export_entries(entries))
     }
 
@@ -77,6 +94,7 @@ impl CardDatabase {
     fn from_export_entries(entries: HashMap<String, CardExportEntry>) -> Self {
         let mut face_index = HashMap::with_capacity(entries.len());
         let mut oracle_id_index: HashMap<String, Vec<String>> = HashMap::new();
+        let mut face_order_index: HashMap<String, usize> = HashMap::new();
         let mut layout_index: HashMap<String, LayoutKind> = HashMap::new();
         let mut legalities = HashMap::new();
         let mut printings_index: HashMap<String, Vec<String>> = HashMap::new();
@@ -86,6 +104,9 @@ impl CardDatabase {
 
         for (export_key, entry) in entries {
             let storage_key = export_key.to_lowercase();
+            if let Some(face_order) = entry.face_index {
+                face_order_index.insert(storage_key.clone(), face_order);
+            }
             if let Some(oracle_id) = entry.face.scryfall_oracle_id.clone() {
                 oracle_id_index
                     .entry(oracle_id.clone())
@@ -111,6 +132,10 @@ impl CardDatabase {
                 legalities.insert(storage_key.clone(), normalized);
             }
         }
+        for keys in oracle_id_index.values_mut() {
+            keys.sort_by_key(|key| face_order_index.get(key).copied().unwrap_or(usize::MAX));
+        }
+        let search_face_keys = build_search_face_keys(&face_index, &face_order_index);
         let name_alias_index = build_name_alias_index(face_index.keys());
         let creature_type_vocabulary = collect_creature_type_vocabulary(face_index.values());
 
@@ -119,6 +144,8 @@ impl CardDatabase {
             face_index,
             name_alias_index,
             oracle_id_index,
+            face_order_index,
+            search_face_keys,
             layout_index,
             legalities,
             printings_index,
@@ -163,6 +190,7 @@ impl CardDatabase {
                 face: face.clone(),
                 legalities: HashMap::new(),
                 layout,
+                face_index: self.face_order_index.get(&key).copied(),
                 printings: self.printings_index.get(&key).cloned().unwrap_or_default(),
                 rulings: self.rulings_index.get(&key).cloned().unwrap_or_default(),
                 bracket_signals: self
@@ -171,7 +199,12 @@ impl CardDatabase {
                     .copied()
                     .unwrap_or_default(),
             };
-            out.insert(face.name.clone(), entry);
+            // Preserve the database storage key, not merely the printed face
+            // name. Meld pairs have two distinct combined-back records with the
+            // same printed name and different oracle ids; oracle-gen keeps the
+            // loser under a hidden `[oracle-id]` key. Re-keying both by
+            // `face.name` here collapsed one half in AI-worker subsets.
+            out.insert(key, entry);
         }
         serde_json::to_string(&out).expect("CardExportEntry serialization is infallible")
     }
@@ -262,6 +295,77 @@ impl CardDatabase {
                 ));
             }
         }
+        errors.extend(self.unenforceable_static_condition_errors());
+        errors
+    }
+
+    /// CR 118.12a + CR 601.2f: no exported static ability may carry a condition
+    /// whose truth is decided by a round-trip its OWN mode's enforcement point
+    /// never runs (`StaticCondition::is_unenforceable_on`).
+    ///
+    /// Such a condition is a false green, not a bug the player can see: the
+    /// layer pipeline hard-codes those leaves to `false`, so the static silently
+    /// never applies while coverage reports the gate fully supported. Awesome
+    /// Presence (CR 509.1b `CantBeBlocked` + an `UnlessPay` no block-declaration
+    /// prompt ever offers) and Hipparion (`BlockRestriction`, same) shipped that
+    /// way for exactly as long as the parser-side gate was the only check.
+    ///
+    /// This is the CORPUS-WIDE half of that gate, and it exists because the
+    /// parser-side half is a call-site discipline that has been breached three
+    /// times. `oracle_static::static_helpers::gate_static_condition` fires only
+    /// where a parser route calls it; this fires on the shipped export no matter
+    /// which route built the definition, so a fourth bypass fails CI on the
+    /// first card that reaches it. Both read the same predicate, so they cannot
+    /// drift apart.
+    ///
+    /// Reported as an integrity error rather than repaired in place on purpose:
+    /// the honest repair needs the clause's Oracle text, which only the parser
+    /// has (see `unenforceable_gate_marker`, which labels the gap with it).
+    /// Silently substituting a marker here would hide the bypass instead of
+    /// surfacing it.
+    ///
+    /// CR 613.1f + CR 604.1: the walk is over
+    /// [`StaticDefinition::walk_self_and_granted`], not over
+    /// `face.static_abilities` alone. A `ContinuousModification::
+    /// GrantStaticAbility` owns a whole nested `StaticDefinition` — its own
+    /// mode, its own scope, and its own `condition` — so the top-level view
+    /// leaves every granted definition unchecked, and an unofferable
+    /// `UnlessPay` inside one bypasses this backstop exactly the way the
+    /// parser-side gate was bypassed three times before it existed. Nesting is
+    /// transitive (a granted static may itself grant one), which is why the
+    /// recursion lives in the shared walk rather than being open-coded here.
+    fn unenforceable_static_condition_errors(&self) -> Vec<String> {
+        let mut errors: Vec<String> = self
+            .face_index
+            .values()
+            .flat_map(|face| {
+                let mut face_errors = Vec::new();
+                for root in &face.static_abilities {
+                    // The collector never breaks, so the traversal always runs
+                    // to completion and the `ControlFlow` result carries no
+                    // information.
+                    let _: ControlFlow<()> = root.walk_self_and_granted(&mut |def| {
+                        let unenforceable = def
+                            .condition
+                            .as_ref()
+                            .filter(|condition| condition.is_unenforceable_on(&def.mode));
+                        if let Some(condition) = unenforceable {
+                            face_errors.push(format!(
+                                "{}: static {:?} carries a condition its enforcement point can \
+                                 never satisfy ({:?}) — it must be routed through \
+                                 oracle_static::static_helpers::gate_static_condition",
+                                face.name, def.mode, condition
+                            ));
+                        }
+                        ControlFlow::Continue(())
+                    });
+                }
+                face_errors
+            })
+            .collect();
+        // `face_index` is a HashMap, so the natural order is nondeterministic;
+        // a CI failure list that reshuffles between runs is unreadable.
+        errors.sort();
         errors
     }
 
@@ -363,6 +467,39 @@ impl CardDatabase {
         }
         lower
     }
+}
+
+pub(crate) fn build_search_face_keys(
+    face_index: &HashMap<String, CardFace>,
+    face_order_index: &HashMap<String, usize>,
+) -> Vec<String> {
+    let mut keys: Vec<String> = face_index.keys().cloned().collect();
+    keys.sort_by(|left_key, right_key| {
+        let left_oracle = face_index
+            .get(left_key)
+            .and_then(|face| face.scryfall_oracle_id.as_deref())
+            .unwrap_or("");
+        let right_oracle = face_index
+            .get(right_key)
+            .and_then(|face| face.scryfall_oracle_id.as_deref())
+            .unwrap_or("");
+        left_oracle
+            .cmp(right_oracle)
+            .then_with(|| {
+                face_order_index
+                    .get(left_key)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(
+                        &face_order_index
+                            .get(right_key)
+                            .copied()
+                            .unwrap_or(usize::MAX),
+                    )
+            })
+            .then_with(|| left_key.cmp(right_key))
+    });
+    keys
 }
 
 /// CR 205.2b + CR 205.3m + CR 308.1: subtype categories are disjoint — a
@@ -483,6 +620,10 @@ struct CardExportEntry {
     /// MTGJSON layout string for multi-face cards (e.g. "modal_dfc", "transform").
     #[serde(default)]
     layout: Option<String>,
+    /// Original zero-based position of this face within MTGJSON's multi-face
+    /// record. Optional so older card-data exports remain loadable.
+    #[serde(default)]
+    face_index: Option<usize>,
     /// Set codes the card has been printed in (from MTGJSON `printings`).
     #[serde(default)]
     printings: Vec<String>,
@@ -591,6 +732,148 @@ mod tests {
             rarities: Default::default(),
             attraction_lights: vec![],
         }
+    }
+
+    /// CR 118.12a: the corpus-wide half of the unenforceable-gate authority.
+    ///
+    /// Both directions matter and neither is exercised by the shipped export
+    /// today (the parser gate defers every such condition before it reaches
+    /// here), so this is the only thing that proves the gate is not vacuous:
+    /// the ACCEPT direction pins that a legitimate `UnlessPay` on a combat-taxed
+    /// mode — Ghostly Prison, the card the whole enforcement-point axis exists
+    /// to keep working — is not swept up, and the REJECT direction pins that the
+    /// same leaf on a mode with no payment prompt fails the export.
+    #[test]
+    fn export_integrity_rejects_only_conditions_their_mode_can_never_satisfy() {
+        use crate::types::ability::{StaticCondition, UnlessPayScaling};
+        use crate::types::mana::ManaCost;
+        use crate::types::statics::StaticMode;
+
+        let pay_gate = || StaticCondition::UnlessPay {
+            cost: ManaCost::NoCost,
+            scaling: UnlessPayScaling::default(),
+            defended: None,
+        };
+        let face_with = |name: &str, mode: StaticMode| {
+            let mut face = test_face(name);
+            let mut def = StaticDefinition::new(mode);
+            def.condition = Some(pay_gate());
+            face.static_abilities = vec![def];
+            face
+        };
+
+        // ACCEPT: CR 508.1h — `WaitingFor::CombatTaxPayment` prompts the
+        // attacking player at declaration, so the gate is satisfiable.
+        let mut taxed = HashMap::new();
+        taxed.insert(
+            "ghostly prison".to_string(),
+            face_with("Ghostly Prison", StaticMode::CantAttack),
+        );
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&taxed).unwrap()).expect("parses");
+        assert!(
+            db.export_integrity_errors().is_empty(),
+            "a payment gate on a combat-taxed mode is enforceable and must pass: {:?}",
+            db.export_integrity_errors()
+        );
+
+        // REJECT: CR 509.1b — no prompt exists at block declaration against an
+        // evasion static, so the layer pipeline hard-codes the leaf `false`.
+        let mut untaxed = HashMap::new();
+        untaxed.insert(
+            "probe".to_string(),
+            face_with("Untaxed Probe", StaticMode::CantBeBlocked),
+        );
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&untaxed).unwrap()).expect("parses");
+        let errors = db.export_integrity_errors();
+        assert!(
+            errors.iter().any(|e| e.contains("Untaxed Probe")),
+            "a payment gate on a mode with no payment prompt must fail the export \
+             no matter which parser route built it, got {errors:?}"
+        );
+    }
+
+    /// CR 613.1f + CR 604.1 + CR 118.12a: a granted static ability is a static
+    /// ability, so the unenforceable-gate backstop must reach the condition on
+    /// the definition a `ContinuousModification::GrantStaticAbility` nests —
+    /// and on the definition THAT one nests, transitively.
+    ///
+    /// Regression for the top-level-only view: the outer definition here is
+    /// deliberately clean (no condition at all, and a mode that WOULD accept a
+    /// payment gate), so the only thing that can fail the export is the inner
+    /// definition's leaf. Before the walk existed this face shipped reported as
+    /// fully supported while the inner `CantBeBlocked` gate was hard-coded
+    /// `false` by the layer pipeline — the exact Awesome Presence shape, one
+    /// level down.
+    #[test]
+    fn export_integrity_reaches_conditions_on_nested_granted_statics() {
+        use crate::types::ability::{ContinuousModification, StaticCondition, UnlessPayScaling};
+        use crate::types::mana::ManaCost;
+        use crate::types::statics::StaticMode;
+
+        let pay_gate = || StaticCondition::UnlessPay {
+            cost: ManaCost::NoCost,
+            scaling: UnlessPayScaling::default(),
+            defended: None,
+        };
+
+        // Innermost: CR 509.1b — no block-declaration prompt exists, so this
+        // leaf is the unofferable gate.
+        let mut inner = StaticDefinition::new(StaticMode::CantBeBlocked);
+        inner.condition = Some(pay_gate());
+
+        // Middle: a granted static that is itself clean, proving the walk does
+        // not stop at the first level of nesting.
+        let mut middle = StaticDefinition::continuous();
+        middle.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(inner),
+        }];
+
+        // Outer/top-level: clean, and on `CantAttack`, whose CR 508.1h combat-tax
+        // prompt makes a payment gate legitimately enforceable — so a top-level
+        // -only check finds nothing to report on this face.
+        let mut outer = StaticDefinition::new(StaticMode::CantAttack);
+        outer.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(middle),
+        }];
+
+        let mut faces = HashMap::new();
+        let mut face = test_face("Nested Grant Probe");
+        face.static_abilities = vec![outer];
+        faces.insert("nested grant probe".to_string(), face);
+        let db =
+            CardDatabase::from_json_str(&serde_json::to_string(&faces).unwrap()).expect("parses");
+
+        let errors = db.export_integrity_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("Nested Grant Probe") && e.contains("CantBeBlocked")),
+            "an unofferable payment gate two levels inside GrantStaticAbility must fail \
+             the export rather than leaving the card falsely supported, got {errors:?}"
+        );
+
+        // ACCEPT direction at depth: the same nesting with an enforceable inner
+        // mode must still pass, so the recursion is not a blanket rejection of
+        // every nested condition.
+        let mut inner_ok = StaticDefinition::new(StaticMode::CantAttack);
+        inner_ok.condition = Some(pay_gate());
+        let mut outer_ok = StaticDefinition::continuous();
+        outer_ok.modifications = vec![ContinuousModification::GrantStaticAbility {
+            definition: Box::new(inner_ok),
+        }];
+        let mut ok_faces = HashMap::new();
+        let mut ok_face = test_face("Nested Taxed Probe");
+        ok_face.static_abilities = vec![outer_ok];
+        ok_faces.insert("nested taxed probe".to_string(), ok_face);
+        let ok_db = CardDatabase::from_json_str(&serde_json::to_string(&ok_faces).unwrap())
+            .expect("parses");
+        assert!(
+            ok_db.export_integrity_errors().is_empty(),
+            "a nested payment gate on a combat-taxed mode is enforceable and must pass: {:?}",
+            ok_db.export_integrity_errors()
+        );
     }
 
     #[test]
@@ -768,6 +1051,55 @@ mod tests {
             db.get_face_by_name("Brigid, Clachan's Heart // Brigid, Doun's Mind")
                 .map(|face| face.name.as_str()),
             Some("Brigid, Clachan's Heart")
+        );
+    }
+
+    #[test]
+    fn single_face_name_containing_double_slash_resolves_to_itself() {
+        // "SP//dr, Piloted by Peni" is a single-faced card whose printed name
+        // literally contains "//". lookup_key must match the exact name before
+        // falling back to its "//"-split, so the card is not mistaken for a
+        // "front // back" combined name (issue #4790).
+        let mut map = HashMap::new();
+        map.insert(
+            "sp//dr, piloted by peni".to_string(),
+            test_face("SP//dr, Piloted by Peni"),
+        );
+        let json = serde_json::to_string(&map).unwrap();
+
+        let db = CardDatabase::from_json_str(&json).unwrap();
+
+        assert_eq!(
+            db.get_face_by_name("SP//dr, Piloted by Peni")
+                .map(|face| face.name.as_str()),
+            Some("SP//dr, Piloted by Peni")
+        );
+    }
+
+    #[test]
+    fn glued_combined_face_name_resolves_front_face() {
+        // A hand-typed glued combined name ("Front//Back", no spaces) resolves to
+        // the front face via lookup_key's bare-"//" split, identically to the
+        // canonical spaced form — so a deck listing a DFC either way still loads.
+        let mut map = HashMap::new();
+        map.insert("peter parker".to_string(), test_face("Peter Parker"));
+        map.insert(
+            "the amazing spider-man".to_string(),
+            test_face("The Amazing Spider-Man"),
+        );
+        let json = serde_json::to_string(&map).unwrap();
+
+        let db = CardDatabase::from_json_str(&json).unwrap();
+
+        assert_eq!(
+            db.get_face_by_name("Peter Parker//The Amazing Spider-Man")
+                .map(|face| face.name.as_str()),
+            Some("Peter Parker")
+        );
+        assert_eq!(
+            db.get_face_by_name("Peter Parker // The Amazing Spider-Man")
+                .map(|face| face.name.as_str()),
+            Some("Peter Parker")
         );
     }
 

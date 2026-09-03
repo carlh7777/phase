@@ -16,11 +16,14 @@ import {
   ACTIVE_DECK_KEY,
   DECK_FOLDERS_KEY,
   DECK_METADATA_KEY,
+  DRAFT_WORKSPACE_PREFERENCES_KEY,
   FEED_DECK_ORIGINS_KEY,
   FEED_SUBSCRIPTIONS_KEY,
   isUserOwnedStorageKey,
   PREFERENCES_KEY,
   STORAGE_KEY_PREFIX,
+  type DeckFolder,
+  type DeckMeta,
 } from "../constants/storage";
 
 /** Versioned envelope. Future shapes go in a `PhaseBackupV2 | …` union. */
@@ -29,6 +32,8 @@ export interface PhaseBackupV1 {
   exportedAt: string;
   /** Raw JSON of the preferences store (`phase-preferences` key), or null. */
   preferences: string | null;
+  /** Raw JSON of personal draft workspace preferences, or null. */
+  draftWorkspacePreferences?: string | null;
   /** Map from deck name → raw JSON of the ParsedDeck. */
   decks: Record<string, string>;
   /** Raw JSON of the deck metadata store, or null. */
@@ -49,6 +54,178 @@ export interface PhaseBackupV1 {
 
 export type PhaseBackup = PhaseBackupV1;
 
+/**
+ * Reconcile deck collections without discarding either device's deck data.
+ *
+ * The local collection keeps its names. A cloud deck with the same name but
+ * different contents is retained under a stable, unique "(Cloud)" suffix;
+ * exact duplicates need only one copy. Profile-level fields deliberately stay
+ * local because their opaque serialized formats do not have a safe structural
+ * merge contract.
+ */
+export function mergeDeckCollections(
+  local: PhaseBackup,
+  cloud: PhaseBackup,
+): PhaseBackupV1 {
+  const decks = { ...local.decks };
+  const cloudDeckNames = new Map<string, string>();
+
+  for (const [name, raw] of Object.entries(cloud.decks)) {
+    const existing = decks[name];
+    if (existing === undefined || existing === raw) {
+      decks[name] = raw;
+      cloudDeckNames.set(name, name);
+      continue;
+    }
+
+    let suffix = 1;
+    let mergedName = `${name} (Cloud)`;
+    while (decks[mergedName] !== undefined) {
+      suffix += 1;
+      mergedName = `${name} (Cloud ${suffix})`;
+    }
+    decks[mergedName] = raw;
+    cloudDeckNames.set(name, mergedName);
+  }
+
+  const { folders, folderIds } = mergeFolders(local.deckFolders, cloud.deckFolders);
+  const deckMetadata = mergeDeckMetadata(
+    local.deckMetadata,
+    cloud.deckMetadata,
+    cloudDeckNames,
+    folderIds,
+  );
+  const feedDeckOrigins = mergeDeckRecord(
+    local.feedDeckOrigins,
+    cloud.feedDeckOrigins,
+    cloudDeckNames,
+  );
+
+  return {
+    ...local,
+    exportedAt: new Date().toISOString(),
+    decks,
+    deckMetadata,
+    deckFolders: folders,
+    feedDeckOrigins,
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseRecord<T>(
+  raw: string | null,
+  isValue?: (value: unknown) => value is T,
+): Record<string, T> | null {
+  if (raw == null) return {};
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (!isRecord(value)) return null;
+    if (isValue && !Object.values(value).every(isValue)) return null;
+    return value as Record<string, T>;
+  } catch {
+    return null;
+  }
+}
+
+function isDeckMeta(value: unknown): value is DeckMeta {
+  if (!isRecord(value) || typeof value.addedAt !== "number") return false;
+  return (
+    (value.lastPlayedAt === undefined || typeof value.lastPlayedAt === "number") &&
+    (value.folderId === undefined || typeof value.folderId === "string") &&
+    (value.starred === undefined || typeof value.starred === "boolean")
+  );
+}
+
+function isDeckFolder(value: unknown): value is DeckFolder {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.order === "number"
+  );
+}
+
+function parseFolders(raw: string | null | undefined): DeckFolder[] | null {
+  if (raw == null) return [];
+  try {
+    const value: unknown = JSON.parse(raw);
+    return Array.isArray(value) && value.every(isDeckFolder) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeFolders(
+  localRaw: string | null | undefined,
+  cloudRaw: string | null | undefined,
+): { folders: string | null; folderIds: Map<string, string> } {
+  const local = parseFolders(localRaw);
+  const cloud = parseFolders(cloudRaw);
+  if (local === null || cloud === null) {
+    return { folders: localRaw ?? null, folderIds: new Map() };
+  }
+
+  const merged = [...local];
+  const folderIds = new Map<string, string>();
+  for (const folder of cloud) {
+    const localFolder = merged.find((candidate) => candidate.id === folder.id);
+    if (localFolder === undefined || (localFolder.name === folder.name && localFolder.order === folder.order)) {
+      if (localFolder === undefined) merged.push(folder);
+      folderIds.set(folder.id, folder.id);
+      continue;
+    }
+
+    let suffix = 1;
+    let id = `${folder.id}-cloud`;
+    while (merged.some((candidate) => candidate.id === id)) {
+      suffix += 1;
+      id = `${folder.id}-cloud-${suffix}`;
+    }
+    merged.push({ ...folder, id });
+    folderIds.set(folder.id, id);
+  }
+  return { folders: JSON.stringify(merged), folderIds };
+}
+
+function mergeDeckMetadata(
+  localRaw: string | null,
+  cloudRaw: string | null,
+  cloudDeckNames: ReadonlyMap<string, string>,
+  folderIds: ReadonlyMap<string, string>,
+): string | null {
+  const local = parseRecord(localRaw, isDeckMeta);
+  const cloud = parseRecord(cloudRaw, isDeckMeta);
+  if (local === null || cloud === null) return localRaw;
+
+  for (const [name, meta] of Object.entries(cloud)) {
+    const mergedName = cloudDeckNames.get(name);
+    if (mergedName === undefined || local[mergedName] !== undefined) continue;
+    const folderId = meta.folderId === undefined ? undefined : (folderIds.get(meta.folderId) ?? meta.folderId);
+    local[mergedName] = { ...meta, ...(folderId === undefined ? {} : { folderId }) };
+  }
+  return JSON.stringify(local);
+}
+
+function mergeDeckRecord<T>(
+  localRaw: string | null,
+  cloudRaw: string | null,
+  cloudDeckNames: ReadonlyMap<string, string>,
+): string | null {
+  const local = parseRecord<T>(localRaw);
+  const cloud = parseRecord<T>(cloudRaw);
+  if (local === null || cloud === null) return localRaw;
+
+  for (const [name, value] of Object.entries(cloud)) {
+    const mergedName = cloudDeckNames.get(name);
+    if (mergedName === undefined || local[mergedName] !== undefined) continue;
+    local[mergedName] = value;
+  }
+  return JSON.stringify(local);
+}
+
 /** Build a backup envelope by snapshotting all user-owned localStorage keys. */
 export function buildBackup(): PhaseBackupV1 {
   const decks: Record<string, string> = {};
@@ -64,6 +241,7 @@ export function buildBackup(): PhaseBackupV1 {
     version: 1,
     exportedAt: new Date().toISOString(),
     preferences: localStorage.getItem(PREFERENCES_KEY),
+    draftWorkspacePreferences: localStorage.getItem(DRAFT_WORKSPACE_PREFERENCES_KEY),
     decks,
     deckMetadata: localStorage.getItem(DECK_METADATA_KEY),
     deckFolders: localStorage.getItem(DECK_FOLDERS_KEY),
@@ -108,6 +286,7 @@ function isBackupV1(value: unknown): value is PhaseBackupV1 {
     field === undefined || stringOrNull(field);
   return (
     stringOrNull(v.preferences) &&
+    optionalStringOrNull(v.draftWorkspacePreferences) &&
     stringOrNull(v.deckMetadata) &&
     optionalStringOrNull(v.deckFolders) &&
     stringOrNull(v.activeDeck) &&
@@ -200,6 +379,11 @@ export function applyBackup(
   const preferencesReplaced = writeValidated(
     PREFERENCES_KEY,
     backup.preferences,
+    true,
+  );
+  writeValidated(
+    DRAFT_WORKSPACE_PREFERENCES_KEY,
+    backup.draftWorkspacePreferences ?? null,
     true,
   );
   writeValidated(DECK_METADATA_KEY, backup.deckMetadata, true);

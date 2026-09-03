@@ -1,5 +1,5 @@
 use crate::game::quantity::resolve_quantity_with_targets;
-use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 
@@ -19,20 +19,26 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (target, count, profile, enters_under) = match &ability.effect {
+    let (target, count, object_source, profile, enters_under) = match &ability.effect {
         Effect::Manifest {
             target,
             count,
+            object_source,
             profile,
             enters_under,
         } => (
             target.clone(),
             resolve_quantity_with_targets(state, count, ability).max(0) as usize,
+            object_source.clone(),
             profile.clone(),
             enters_under.clone(),
         ),
         _ => return Err(EffectError::MissingParam("count".to_string())),
     };
+
+    // CR 608.2c: this instruction owns the chain's referent slot from here on,
+    // including the arms where it produces nothing.
+    crate::game::morph::begin_face_down_referent_production(state);
 
     // `player` is the LIBRARY OWNER (whose top cards are manifested), resolved
     // from `target`. `controller` is the optional CR 110.2a override for which
@@ -54,31 +60,105 @@ pub fn resolve(
     // manifest default (CR 701.40a).
     let profile = profile.unwrap_or_else(crate::types::ability::FaceDownProfile::vanilla_2_2);
 
-    // CR 701.40e: Manifest cards one at a time
-    for _ in 0..count {
-        // CR 701.40a: Resolve the top card of the library owner's library, then
-        // manifest it through the shared morph infrastructure, routing the
-        // effect-specified profile and the optional controller override.
-        let object_id = match crate::game::morph::top_library_object(state, player) {
-            Ok(id) => id,
-            // The library owner has no cards left — stop manifesting.
-            Err(_) => break,
-        };
-        crate::game::morph::manifest_card(
-            state,
-            player,
-            object_id,
-            ability.source_id,
-            profile.clone(),
-            controller,
-            events,
-        )
-        .map_err(|e| EffectError::MissingParam(format!("{e}")))?;
+    match object_source {
+        // CR 701.40a + CR 101.4: Manifest the chain's accumulated TRACKED SET —
+        // the per-player picks an `Each*`-owned `ChooseFromZone` collected
+        // ("up to two target players each manifest two cards from their
+        // hands", Kozilek, the Broken Reality). Unlike Cloak's tracked-set arm
+        // (Expose the Culprit), the members live in non-battlefield zones
+        // (their owners' hands), so `manifest_card` is a real move with no
+        // exile dance. `controller: None` keeps the CR 701.40a owner default —
+        // each card enters under the control of the player who chose it from
+        // their own hand.
+        Some(TargetFilter::TrackedSet { .. }) => {
+            // CR 608.2c: bind the `TrackedSetId(0)` sentinel to the chain's
+            // published pick set (mirrors the Cloak arm).
+            let member_ids: Vec<crate::types::identifiers::ObjectId> =
+                match crate::game::targeting::resolve_tracked_set_sentinel(
+                    state,
+                    TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0),
+                    },
+                ) {
+                    TargetFilter::TrackedSet { id } => state
+                        .tracked_object_sets
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+            // CR 608.2c: the chain's referent now changes hands — the picks
+            // have been read, and what follows ("for each card manifested this
+            // way") must count the MANIFESTED cards, not the chosen ones. Rebind
+            // to a fresh chain set so the shared post-effect publisher records
+            // exactly the manifest results; leaving the pick set in place would
+            // double-count every card (mirrors the fresh-set rebind in
+            // `choose_from_zone::drain_active_per_player_zone_choice`).
+            super::publish_fresh_tracked_set(state, Vec::new());
+            for object_id in member_ids {
+                crate::game::morph::manifest_card(
+                    state,
+                    player,
+                    object_id,
+                    ability.source_id,
+                    profile.clone(),
+                    controller,
+                    events,
+                )
+                .map_err(|e| EffectError::MissingParam(format!("{e}")))?;
+            }
+        }
+        // CR 701.40a: Manifest explicit objects forwarded onto
+        // `ability.targets` by a parent `ChooseFromZone` (Scroll of Fate's
+        // "manifest a card from your hand"). Those cards live in a
+        // non-battlefield zone, so `manifest_card` is a real move (CR 608.2c —
+        // later instructions read the earlier selection). Mirrors the
+        // `Cloak.object_source` branch, minus the ward profile.
+        Some(filter) => {
+            let object_ids = super::effect_object_targets(&filter, &ability.targets);
+            for object_id in object_ids {
+                crate::game::morph::manifest_card(
+                    state,
+                    player,
+                    object_id,
+                    ability.source_id,
+                    profile.clone(),
+                    controller,
+                    events,
+                )
+                .map_err(|e| EffectError::MissingParam(format!("{e}")))?;
+            }
+        }
+        // CR 701.40e: Manifest cards one at a time
+        None => {
+            for _ in 0..count {
+                // CR 701.40a: Resolve the top card of the library owner's
+                // library, then manifest it through the shared morph
+                // infrastructure, routing the effect-specified profile and the
+                // optional controller override.
+                let object_id = match crate::game::morph::top_library_object(state, player) {
+                    Ok(id) => id,
+                    // The library owner has no cards left — stop manifesting.
+                    Err(_) => break,
+                };
+                crate::game::morph::manifest_card(
+                    state,
+                    player,
+                    object_id,
+                    ability.source_id,
+                    profile.clone(),
+                    controller,
+                    events,
+                )
+                .map_err(|e| EffectError::MissingParam(format!("{e}")))?;
+            }
+        }
     }
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -99,6 +179,7 @@ mod tests {
             Effect::Manifest {
                 target: TargetFilter::Controller,
                 count: QuantityExpr::Fixed { value: count },
+                object_source: None,
                 profile: None,
                 enters_under: None,
             },
@@ -117,6 +198,7 @@ mod tests {
             Effect::Manifest {
                 target: target_filter,
                 count: QuantityExpr::Fixed { value: count },
+                object_source: None,
                 profile: None,
                 enters_under: None,
             },
@@ -292,6 +374,7 @@ mod tests {
             object_id: ObjectId(404),
             lki: crate::types::game_state::LKISnapshot {
                 name: "Exiled Creature".to_string(),
+                token_image_ref: None,
                 power: Some(2),
                 toughness: Some(2),
                 base_power: Some(2),
@@ -307,6 +390,8 @@ mod tests {
                 chosen_attributes: Vec::new(),
                 counters: std::collections::HashMap::new(),
                 tapped: false,
+                is_suspected: false,
+                attachments: Vec::new(),
             },
         });
 
@@ -355,14 +440,19 @@ mod tests {
             excess: 0,
         });
 
-        let ability = make_manifest_ability_for_target(1, TargetFilter::TriggeringPlayer, vec![]);
+        let mut ability =
+            make_manifest_ability_for_target(1, TargetFilter::TriggeringPlayer, vec![]);
+        if let Effect::Manifest { enters_under, .. } = &mut ability.effect {
+            *enters_under = Some(crate::types::ability::ControllerRef::You);
+        }
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
 
         let obj = &state.objects[&opponent_card];
         assert!(obj.face_down);
         assert_eq!(obj.zone, Zone::Battlefield);
-        assert_eq!(obj.controller, damaged_player);
+        assert_eq!(obj.owner, damaged_player);
+        assert_eq!(obj.controller, caster);
     }
 
     /// CR 708.2a + CR 110.2a: Manifest with an effect-specified `profile`
@@ -402,11 +492,13 @@ mod tests {
             extra_core_types: vec![CoreType::Artifact],
             subtypes: vec!["Cyberman".to_string()],
             ward: None,
+            cause: crate::types::ability::FaceDownCause::Manifest,
         };
         let ability = ResolvedAbility::new(
             Effect::Manifest {
                 target: TargetFilter::TriggeringPlayer,
                 count: QuantityExpr::Fixed { value: 2 },
+                object_source: None,
                 profile: Some(profile),
                 enters_under: Some(crate::types::ability::ControllerRef::You),
             },

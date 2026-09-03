@@ -13,10 +13,12 @@ use engine::types::phase::Phase;
 
 fn specialize_back(name: &str, color: ManaColor, shard: ManaCostShard) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
         name: name.into(),
         power: Some(3),
         toughness: Some(3),
         loyalty: None,
+        printed_loyalty: None,
         defense: None,
         card_types: CardType {
             core_types: vec![CoreType::Creature],
@@ -40,6 +42,7 @@ fn specialize_back(name: &str, color: ManaColor, shard: ManaCostShard) -> BackFa
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

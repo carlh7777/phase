@@ -1,8 +1,15 @@
 {
   "concedeDialog": {
     "title": "Concedere la partita?",
-    "message": "Il tuo avversario sarà dichiarato vincitore.",
-    "concede": "Concedi"
+    "game": {
+      "label": "Concedi questa partita",
+      "ordinaryMessage": "Il tuo avversario vince questa partita.",
+      "matchMessage": "Concedi solo la partita attuale. Se il match non è deciso, seguiranno sideboard o partita successiva."
+    },
+    "match": {
+      "label": "Concedi l'intero match",
+      "message": "Concedi il match. Il tuo avversario vince il match e non verranno giocate altre partite."
+    }
   },
   "takebackDialog": {
     "requestedTitle": "{{name}} richiede un ripristino",
@@ -53,16 +60,18 @@
     "matchScore": "Punteggio della partita {{p0}}-{{p1}}{{draws}}. Sposta le carte tra principale e sideboard, poi invia.",
     "draws_one": " ({{count}} pareggio)",
     "draws_other": " ({{count}} pareggi)",
-    "main": "Principale ({{count}}/{{total}})",
+    "main": "Principale ({{count}}, min {{min}})",
     "sideboard": "Sideboard ({{count}})",
+    "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Sposta carte dalla sideboard.",
     "moveFromMain": "Sposta carte dal mazzo principale.",
-    "matchesRegistered": "Il mazzo principale corrisponde alla dimensione registrata ({{total}}).",
-    "submitDisabled": "Il mazzo principale è {{count}} / {{total}} — invio disabilitato.",
     "resetAria": "Reimposta al mazzo registrato",
     "reset": "Reimposta",
     "submitAria": "Invia il mazzo per la prossima partita",
-    "submitDeck": "Invia mazzo"
+    "submitDeck": "Invia mazzo",
+    "readyToSubmit": "Il mazzo è legale — pronto per l'invio.",
+    "belowMinimum": "Il mazzo principale richiede almeno {{min}} carte — ora {{count}}.",
+    "overSideboardCap": "Il sideboard ha {{count}} carte — massimo {{max}}."
   },
   "brokerOfflinePrompt": {
     "title": "Server della lobby irraggiungibile",
@@ -71,6 +80,12 @@
   },
   "joinErrorDialog": {
     "dismiss": "Ignora"
+  },
+  "reconnectRejected": {
+    "firstMessageInvalid": "L'host ha rifiutato la connessione prima della configurazione. Aggiorna entrambe le finestre e riprova.",
+    "versionRequired": "Questo host richiede il protocollo di connessione v{{version}}. Aggiorna entrambe le finestre e riprova.",
+    "versionMismatch": "Il protocollo di connessione non corrisponde: il tuo client ha inviato v{{guestVersion}}, ma l'host usa v{{hostVersion}}. Aggiorna entrambe le finestre.",
+    "malformedAuthority": "L'host ha rifiutato un'autorizzazione di connessione non valida. Rientra con un nuovo codice stanza."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking irraggiungibile",
@@ -110,6 +125,7 @@
     "subtitle": "Scegli una regione, o connettiti a un'istanza self-hosted.",
     "noneLabel": "Nessuno (solo P2P)",
     "directCodes": "codici diretti",
+    "official": "Ufficiale",
     "selfHosted": "Self-hosted",
     "customUrlPlaceholder": "wss://tuo-server.esempio/ws",
     "test": "Testa",
@@ -204,7 +220,17 @@
     "back": "Indietro",
     "opening": "Apertura…",
     "hostP2PGame": "Ospita partita P2P",
-    "hostGame": "Ospita partita"
+    "hostGame": "Ospita partita",
+    "savedFormats": "Formati personalizzati salvati",
+    "saveAsCustomFormat": "Salva formato",
+    "customFormatNamePlaceholder": "Dai un nome a questo formato",
+    "useCustomFormat": "Usa",
+    "customFormatInUse": "In uso",
+    "deleteCustomFormat": "Elimina",
+    "loadingCustomFormat": "Caricamento del formato…",
+    "noSavedCustomFormats": "Nessun formato personalizzato salvato.",
+    "customFormatResolveFailed": "Impossibile caricare il formato salvato.",
+    "customFormatHostingUnavailable": "Ospitare con un formato personalizzato non è ancora supportato — la legalità del mazzo non può essere verificata per esso. Per ora, salvalo e limitati all'anteprima."
   },
   "page": {
     "deckRejected": "Il mazzo è stato rifiutato dall'host.",

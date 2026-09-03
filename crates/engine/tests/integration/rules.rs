@@ -16,6 +16,29 @@ pub use engine::types::phase::Phase;
 pub use engine::types::player::PlayerId;
 pub use engine::types::zones::{ExileCostSourceZone, Zone};
 
+/// Shared damage fixture: a non-combat source dealing `amount` to `target`,
+/// controlled by P1 (the opponent of the shield controller in the CR 614.9
+/// redirection fixtures). Shared by `heroic_sacrifice_redirect`,
+/// `pariah_attached_redirect`, and `palisade_giant_redirect`, which previously
+/// each carried a byte-identical private copy.
+pub fn damage_ability(
+    source_id: ObjectId,
+    target: engine::types::ability::TargetRef,
+    amount: i32,
+) -> engine::types::ability::ResolvedAbility {
+    engine::types::ability::ResolvedAbility::new(
+        engine::types::ability::Effect::DealDamage {
+            amount: engine::types::ability::QuantityExpr::Fixed { value: amount },
+            target: engine::types::ability::TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        },
+        vec![target],
+        source_id,
+        P1,
+    )
+}
+
 /// Shared combat helper: drives the engine from DeclareAttackers through damage resolution.
 ///
 /// Assumes the runner is at a phase where passing priority twice will reach DeclareAttackers
@@ -58,6 +81,28 @@ pub fn run_combat_with_blocker_divisions(
             bands: vec![],
         })
         .expect("DeclareAttackers should succeed");
+
+    // CR 603.3b: same-controller attack triggers (e.g. Stonehoof Chieftain with
+    // many attackers) may surface an ordering prompt before priority.
+    while matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
+        let n = if let WaitingFor::OrderTriggers { triggers, .. } = &runner.state().waiting_for {
+            triggers.len()
+        } else {
+            0
+        };
+        runner
+            .act(GameAction::OrderTriggers {
+                order: (0..n).collect(),
+            })
+            .expect("OrderTriggers should succeed");
+    }
+
+    // CR 508.2 + CR 603.3b: attack triggers (Stonehoof Chieftain #5335) must
+    // resolve before declare blockers — a single priority pass is not enough
+    // when many identical per-attacker triggers stacked.
+    if !runner.state().stack.is_empty() {
+        runner.advance_until_stack_empty();
+    }
 
     // CR 508.2: Active player gets priority after attackers — pass through it.
     if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {

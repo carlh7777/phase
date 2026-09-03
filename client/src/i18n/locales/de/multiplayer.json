@@ -1,8 +1,15 @@
 {
   "concedeDialog": {
     "title": "Spiel aufgeben?",
-    "message": "Dein Gegner wird zum Sieger erklärt.",
-    "concede": "Aufgeben"
+    "game": {
+      "label": "Dieses Spiel aufgeben",
+      "ordinaryMessage": "Dein Gegner gewinnt dieses Spiel.",
+      "matchMessage": "Du gibst nur das aktuelle Spiel auf. Ist das Match noch nicht entschieden, folgt das Sideboarden oder das nächste Spiel."
+    },
+    "match": {
+      "label": "Gesamtes Match aufgeben",
+      "message": "Du gibst das Match auf. Dein Gegner gewinnt das Match und es werden keine weiteren Spiele gespielt."
+    }
   },
   "takebackDialog": {
     "requestedTitle": "{{name}} beantragt eine Rücknahme",
@@ -53,16 +60,18 @@
     "matchScore": "Partiestand {{p0}}-{{p1}}{{draws}}. Verschiebe Karten zwischen Haupt und Sideboard und reiche dann ein.",
     "draws_one": " ({{count}} Unentschieden)",
     "draws_other": " ({{count}} Unentschieden)",
-    "main": "Haupt ({{count}}/{{total}})",
+    "main": "Haupt ({{count}}, min. {{min}})",
     "sideboard": "Sideboard ({{count}})",
+    "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Karten aus dem Sideboard verschieben.",
     "moveFromMain": "Karten aus dem Hauptdeck verschieben.",
-    "matchesRegistered": "Hauptdeck entspricht der registrierten Größe ({{total}}).",
-    "submitDisabled": "Hauptdeck hat {{count}} / {{total}} — Einreichen deaktiviert.",
     "resetAria": "Auf registriertes Deck zurücksetzen",
     "reset": "Zurücksetzen",
     "submitAria": "Deck für das nächste Spiel einreichen",
-    "submitDeck": "Deck einreichen"
+    "submitDeck": "Deck einreichen",
+    "readyToSubmit": "Deck ist legal — bereit zum Einreichen.",
+    "belowMinimum": "Hauptdeck benötigt mindestens {{min}} Karten — aktuell {{count}}.",
+    "overSideboardCap": "Sideboard hat {{count}} Karten — maximal {{max}}."
   },
   "brokerOfflinePrompt": {
     "title": "Lobby-Server nicht erreichbar",
@@ -71,6 +80,12 @@
   },
   "joinErrorDialog": {
     "dismiss": "Schließen"
+  },
+  "reconnectRejected": {
+    "firstMessageInvalid": "Der Host hat die Verbindung vor der Einrichtung abgelehnt. Aktualisiere beide Fenster und versuche es erneut.",
+    "versionRequired": "Dieser Host benötigt das Übertragungsprotokoll v{{version}}. Aktualisiere beide Fenster und versuche es erneut.",
+    "versionMismatch": "Übertragungsprotokoll stimmt nicht überein: Dein Client hat v{{guestVersion}} gesendet, der Host verwendet jedoch v{{hostVersion}}. Aktualisiere beide Fenster.",
+    "malformedAuthority": "Der Host hat eine ungültige Verbindungsberechtigung abgelehnt. Tritt mit einem neuen Raumcode erneut bei."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking nicht erreichbar",
@@ -110,6 +125,7 @@
     "subtitle": "Wähle eine Region oder verbinde dich mit einer selbst gehosteten Instanz.",
     "noneLabel": "Keiner (nur P2P)",
     "directCodes": "direkte Codes",
+    "official": "Offiziell",
     "selfHosted": "Selbst gehostet",
     "customUrlPlaceholder": "wss://dein-server.beispiel/ws",
     "test": "Testen",
@@ -204,7 +220,17 @@
     "back": "Zurück",
     "opening": "Wird geöffnet…",
     "hostP2PGame": "P2P-Spiel hosten",
-    "hostGame": "Spiel hosten"
+    "hostGame": "Spiel hosten",
+    "savedFormats": "Gespeicherte eigene Formate",
+    "saveAsCustomFormat": "Format speichern",
+    "customFormatNamePlaceholder": "Format benennen",
+    "useCustomFormat": "Verwenden",
+    "customFormatInUse": "In Verwendung",
+    "deleteCustomFormat": "Löschen",
+    "loadingCustomFormat": "Format wird geladen…",
+    "noSavedCustomFormats": "Noch keine eigenen Formate gespeichert.",
+    "customFormatResolveFailed": "Dieses gespeicherte Format konnte nicht geladen werden.",
+    "customFormatHostingUnavailable": "Das Hosten mit einem eigenen Format wird noch nicht unterstützt — die Deck-Legalität kann dafür nicht geprüft werden. Speichere und sieh es dir vorerst nur an."
   },
   "page": {
     "deckRejected": "Das Deck wurde vom Host abgelehnt.",

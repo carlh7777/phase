@@ -1,9 +1,18 @@
+#[cfg(test)]
+use engine::ai_support::is_pact_payment_ability;
+use engine::ai_support::{
+    certify_pact_plan, current_target_selection_targets, find_copy_targets, is_pact_payment_cast,
+};
 use engine::game::combat;
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::keywords;
+use engine::game::life_safety::{preview_candidate_life_safety, CandidateLifeSafety};
 use engine::game::mana_abilities;
 use engine::game::quantity::resolve_quantity;
 use engine::game::targeting::find_legal_targets;
 use engine::game::turn_control;
+#[cfg(test)]
+use engine::types::ability::AbilityCondition;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, DelayedTriggerCondition, Effect, EffectScope,
     QuantityExpr, ReplacementMode, TapStateChange, TargetFilter, TargetRef,
@@ -19,6 +28,7 @@ use engine::types::phase::Phase;
 use engine::types::replacements::ReplacementEvent;
 use engine::types::zones::Zone;
 
+use crate::card_value::intrinsic_value;
 use crate::cast_facts::collect_definition_effects;
 use crate::damage_reflection::{
     is_event_context_damage_to_player, opponent_creature_reflection_penalty,
@@ -28,15 +38,19 @@ use engine::game::players;
 
 use super::activation::turn_only;
 use super::context::PolicyContext;
-use super::copy_value::{copy_target_penalties, score_legend_rule_keep};
+use super::copy_value::{
+    copy_effect_strips_legendary, copy_target_penalties, score_legend_rule_keep,
+};
 use super::effect_classify::{
     aggregate_player_impact, aura_polarity, effect_polarity, effect_targets_object,
     extract_target_filter, is_spell_beneficial, lethal_to_creature, targeted_object_impact,
     targeted_player_impact, targets_creatures, targets_creatures_only, EffectPolarity,
+    PLAYER_IMPACT_PREFERENCE_BAND,
 };
 use super::registry::{
     DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy, CRITICAL_MAX,
 };
+use super::removal_lethality;
 use super::strategy_helpers::can_pay_ward_cost;
 use crate::features::DeckFeatures;
 #[cfg(test)]
@@ -63,6 +77,7 @@ impl AntiSelfHarmPolicy {
                 .iter()
                 .map(|target| score_target_ref(ctx, target))
                 .sum(),
+            GameAction::SelectModes { .. } => score_selected_modes(ctx),
             // Penalise accepting an optional effect whose life cost would kill or nearly kill us.
             GameAction::DecideOptionalEffect { accept: true } => score_optional_effect_accept(ctx),
             GameAction::ChooseLegend { keep } => score_legend_rule_keep(ctx.state, *keep),
@@ -80,6 +95,7 @@ impl TacticalPolicy for AntiSelfHarmPolicy {
         &[
             DecisionKind::CastSpell,
             DecisionKind::ActivateAbility,
+            DecisionKind::ManaPayment,
             DecisionKind::SelectTarget,
         ]
     }
@@ -94,6 +110,19 @@ impl TacticalPolicy for AntiSelfHarmPolicy {
     }
 
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
+        if let CandidateLifeSafety::Unsafe {
+            before,
+            after,
+            committed,
+        } = preview_candidate_life_safety(ctx.state, ctx.candidate)
+        {
+            return PolicyVerdict::reject(
+                PolicyReason::new("anti_self_harm_lethal_life_commitment")
+                    .with_fact("before", i64::from(before))
+                    .with_fact("after", i64::from(after))
+                    .with_fact("committed", i64::from(committed)),
+            );
+        }
         if let Some(reason) = reject_reason(ctx) {
             return PolicyVerdict::reject(reason);
         }
@@ -110,6 +139,12 @@ impl TacticalPolicy for AntiSelfHarmPolicy {
 
 fn reject_reason(ctx: &PolicyContext<'_>) -> Option<PolicyReason> {
     match &ctx.candidate.action {
+        GameAction::CastSpell { .. }
+            if is_pact_payment_cast(ctx.state, &ctx.candidate.action)
+                && certify_pact_plan(ctx.state, ctx.candidate).is_none() =>
+        {
+            Some(PolicyReason::new("anti_self_harm_next_upkeep_mana_loss"))
+        }
         GameAction::CastSpell { .. } if cast_has_unpayable_self_etb_may_cost(ctx) => {
             Some(PolicyReason::new("anti_self_harm_unpayable_etb_may_cost"))
         }
@@ -281,7 +316,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
                             && o.name == source.name
                     }) && !engine::game::sba::legend_rule_exempt(ctx.state, id)
                 })
-                .then_some(-8.0)
+                .then_some(ctx.penalties().wasted_cast_penalty)
         })
         .unwrap_or(0.0);
 
@@ -315,21 +350,23 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
     // ETB-only permanents (e.g. Gravedigger): the spell itself has no targets,
     // but the card's value may come from a targeted ETB trigger. If no valid
     // target exists for that ETB trigger, casting wastes the card.
-    let etb_whiff_penalty = if let Some(facts) = ctx.cast_facts() {
-        if facts.requires_targets_in_immediate_etb
-            && !facts.requires_targets_in_spell_text
-            && !etb_trigger_has_valid_targets(ctx, &facts)
-        {
-            -8.0
-        } else {
-            0.0
+    let (etb_whiff_penalty, copy_whiff_penalty) = match ctx.cast_facts() {
+        Some(facts) => {
+            let etb_whiff = if facts.requires_targets_in_immediate_etb
+                && !facts.requires_targets_in_spell_text
+                && !etb_trigger_has_valid_targets(ctx, &facts)
+            {
+                ctx.penalties().wasted_cast_penalty
+            } else {
+                0.0
+            };
+            (etb_whiff, copy_source_whiff_penalty(ctx, &facts))
         }
-    } else {
-        0.0
+        None => (0.0, 0.0),
     };
 
     if !has_beneficial_creature_target && !has_harmful_creature_only_target && !has_harmful_bounce {
-        return legend_penalty + etb_whiff_penalty;
+        return legend_penalty + etb_whiff_penalty + copy_whiff_penalty;
     }
 
     let has_own_creature = ctx.state.battlefield.iter().any(|&id| {
@@ -360,20 +397,48 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
 
     // Beneficial creature-targeting spell but no own creatures to buff.
     if has_beneficial_creature_target && !has_own_creature {
-        penalty -= 8.0;
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
-    // Harmful creature-only spell (e.g. Murder) but no targetable opponent creatures.
-    if has_harmful_creature_only_target && !has_targetable_opponent_creature {
-        penalty -= 8.0;
+    // Harmful creature-only spell (e.g. Murder) but no targetable opponent
+    // creatures. A MIXED spell carrying a useful wipe line (`DestroyAll`,
+    // CR 701.8) is NOT a whiff even when every opposing creature is
+    // hexproof/protected: the wipe is NON-targeted and hits the population
+    // (CR 115.10a), so consult the resolver-mirroring mass seam before
+    // charging the no-target penalty.
+    if has_harmful_creature_only_target
+        && !has_targetable_opponent_creature
+        && !ctx.has_opposing_mass_population()
+    {
+        penalty += ctx.penalties().wasted_cast_penalty;
+    }
+
+    // Harmful creature-only spell whose damage is provably non-lethal against
+    // EVERY legal target (CR 704.5g): committing a whiff burns the card. The
+    // existing `lethal_to_creature` branch above (is_useful_removal_target)
+    // only detects provable non-lethality for FIXED damage amounts; for a
+    // dynamic amount (Slash of Light's "number of creatures you control +
+    // number of Equipment you control") it fails open as `None` -> "useful",
+    // so it never fires. `can_kill_any_legal_target` resolves the amount live
+    // (CR 120.3 / CR 701) via the `removal_lethality` damage model and vetoes
+    // (soft) only the total whiff. Soft penalty (NOT a hard reject): it mirrors
+    // the sibling whiff branches, and synergy / prowess / storm-type
+    // spellslinger policies may still prefer to cast for cast-triggers.
+    if has_harmful_creature_only_target
+        && has_targetable_opponent_creature
+        && !removal_lethality::can_kill_any_legal_target(ctx)
+    {
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
     // Harmful bounce with no opposing legal targets will force a self-bounce line.
     if has_harmful_bounce && !has_opponent_bounce_target(ctx, &effects) {
-        penalty -= 8.0;
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
     penalty += etb_whiff_penalty;
+
+    penalty += copy_whiff_penalty;
 
     penalty += legend_penalty;
 
@@ -449,6 +514,48 @@ fn optional_effect_life_cost(ctx: &PolicyContext<'_>, source_id: ObjectId) -> Op
             _ => None,
         })
         .max()
+}
+
+/// CR 614.1c + CR 707.2: an "enters as a copy" replacement is what gives a
+/// clone-class permanent its characteristics — the printed card is a bodyless
+/// 0/0 shell. With no legal copy source it enters as that shell and CR 704.5f
+/// puts it straight into its owner's graveyard, so the cast is wasted.
+///
+/// A copy source is chosen while the permanent enters, not targeted, so the
+/// presence question goes to the engine's `find_copy_targets` (which reads the
+/// source zone off the filter and ignores hexproof/shroud) rather than to
+/// `find_legal_targets`.
+fn copy_source_whiff_penalty(
+    ctx: &PolicyContext<'_>,
+    facts: &crate::cast_facts::CastFacts<'_>,
+) -> f64 {
+    // Card-local gates first — only a clone-class candidate reaches the scan.
+    let Some(filter) = facts.requires_copy_source_on_entry else {
+        return 0.0;
+    };
+    // CR 704.5f kills only a creature whose toughness is 0 or less. A bodied
+    // clone (Sakashima the Impostor 3/1, Hulking Metamorph 7/7) survives an
+    // un-copied entry, and a non-creature copier has no toughness at all.
+    if !facts.is_creature()
+        || !facts
+            .object
+            .base_toughness
+            .is_some_and(|toughness| toughness <= 0)
+    {
+        return 0.0;
+    }
+    // CR 607.2a: The Mimeoplasm's copy source is one of the cards exiled by its
+    // own linked entry cost, so it is established only after that cost is paid
+    // and a pre-payment lookup cannot disqualify the replacement. The engine's
+    // replacement applicability check skips this filter for the same reason.
+    if matches!(filter, TargetFilter::ExiledCardByIndex { .. }) {
+        return 0.0;
+    }
+    if find_copy_targets(ctx.state, filter, facts.object.id, ctx.ai_player, None).is_empty() {
+        ctx.penalties().wasted_cast_penalty
+    } else {
+        0.0
+    }
 }
 
 /// Check if any ETB trigger on the permanent has a valid target on the battlefield.
@@ -545,7 +652,7 @@ fn is_useful_removal_target(ctx: &PolicyContext<'_>, id: ObjectId, effects: &[&E
     if let Some(object) = ctx.state.objects.get(&id) {
         for keyword in &object.keywords {
             if let Keyword::Ward(ward) = keyword {
-                if !can_pay_ward_cost(ctx, ward) {
+                if !can_pay_ward_cost(ctx, ward, object) {
                     return false;
                 }
                 break;
@@ -566,6 +673,256 @@ fn is_hostile_or_neutral_bounce(effect: &&Effect) -> bool {
     )
 }
 
+/// Polarity of the pending spell/ability *for whoever fills one target slot*,
+/// resolved as a three-way ladder shared by the player arm, the object arm and
+/// the own-permanent veto so all three read one signal.
+///
+/// 1. The per-target impact (`targeted_player_impact` / `targeted_object_impact`)
+///    when it is outside the preference band. A `Some(0.0)` is deliberately NOT
+///    a signal: Strength of the Tajuru's chain matches this candidate only
+///    through its two `TargetOnly` markers (Contextual, 0.0) while the real
+///    `PutCounter{+1/+1}` payoff is keyed to `ParentTarget` and matches no
+///    filter here, so reading `Some(0.0)` as "not beneficial" made the AI
+///    prefer the opponent's creature.
+/// 2. The spell-level aggregate impact.
+/// 3. The dominant effect's own polarity.
+///
+/// `Contextual` out means no layer had a signal — callers fall back to
+/// `is_spell_beneficial` (which additionally resolves Mutate, mass-effect
+/// survivors and Aura statics), and the veto stands down entirely.
+fn slot_polarity(ctx: &PolicyContext<'_>, targeted_impact: Option<f64>) -> EffectPolarity {
+    if let Some(impact) = targeted_impact {
+        if impact > PLAYER_IMPACT_PREFERENCE_BAND {
+            return EffectPolarity::Beneficial;
+        }
+        if impact < -PLAYER_IMPACT_PREFERENCE_BAND {
+            return EffectPolarity::Harmful;
+        }
+    }
+
+    let aggregate = aggregate_player_impact(ctx);
+    if aggregate > PLAYER_IMPACT_PREFERENCE_BAND {
+        return EffectPolarity::Beneficial;
+    }
+    if aggregate < -PLAYER_IMPACT_PREFERENCE_BAND {
+        return EffectPolarity::Harmful;
+    }
+
+    ctx.effects()
+        .first()
+        .map_or(EffectPolarity::Contextual, |effect| effect_polarity(effect))
+}
+
+/// [`slot_polarity`] resolved to "beneficial for whoever fills this slot",
+/// falling back to the spell-level polarity when no layer carried a signal.
+fn slot_is_beneficial(
+    ctx: &PolicyContext<'_>,
+    targeted_impact: Option<f64>,
+    spell_beneficial: bool,
+) -> bool {
+    match slot_polarity(ctx, targeted_impact) {
+        EffectPolarity::Beneficial => true,
+        EffectPolarity::Harmful => false,
+        EffectPolarity::Contextual => spell_beneficial,
+    }
+}
+
+/// Riders that make aiming a harmful-looking effect at the AI's OWN permanent
+/// the deliberate play. Both are keyed to the target itself, so a payoff that
+/// merely follows the target wherever it lands (Beast Within's "its controller
+/// creates a 3/3", which gifts the token to whoever controlled the destroyed
+/// permanent) can never buy an exemption.
+fn is_deliberate_self_target_rider(effect: &&Effect) -> bool {
+    // A bounce whose filter can legally reach anyone is a value play on one's
+    // own permanent (re-buy an ETB, rescue it in response to removal).
+    // `score_pre_cast` excludes `Effect::Bounce` from its harmful-target class
+    // for exactly this reason. The `controller: You` half needs no arm: such a
+    // slot never offers an opponent-controlled object, so the veto below cannot
+    // fire on it anyway.
+    if is_hostile_or_neutral_bounce(effect) {
+        return true;
+    }
+    // Flicker exiles the target and returns it as a new object, so
+    // aiming it at one's own permanent is the entire point of the card. The
+    // return leg names the exiled target either directly (`ParentTarget` —
+    // Cloudshift, Acrobatic Maneuver) or through the chain's tracked set
+    // (`TrackedSet` — Flicker, Ephemerate, Ghostly Flicker); both are the same
+    // "return it to the battlefield" clause and neither may be vetoed.
+    matches!(
+        effect,
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            target: TargetFilter::ParentTarget | TargetFilter::TrackedSet { .. },
+            ..
+        }
+    )
+}
+
+/// At a single-object target slot, refuse to spend a harmful spell on
+/// one of the AI's own permanents while that same slot still offers an
+/// opponent-controlled object. Without this the only residual signal was
+/// `score_target_object`'s `controller_delta * 2.0`; a land carries no creature
+/// value, so "Beast Within my own Forest" priced at −2.0 and was routinely
+/// outvoted by the 3/3 Beast the search eval saw the AI gaining.
+///
+/// Slot-local by construction: the alternatives come from the engine's
+/// current-slot authority (`current_target_selection_targets`, the same
+/// `selection.current_legal_targets` the candidate list itself was issued from),
+/// never a board-wide `find_legal_targets` sweep.
+///
+/// Scope is `ChooseTarget { Some(Object) }` only. A `SelectTargets` submission
+/// commits a whole subset at once, where "an opponent's object is still
+/// available" is not a per-slot question; those stay on the scoring path.
+fn own_permanent_with_opponent_alternative(
+    ctx: &PolicyContext<'_>,
+    object_id: ObjectId,
+) -> Option<PolicyReason> {
+    if !matches!(
+        ctx.candidate.action,
+        GameAction::ChooseTarget {
+            target: Some(TargetRef::Object(_))
+        }
+    ) {
+        return None;
+    }
+
+    if ctx.state.objects.get(&object_id)?.controller != ctx.ai_player {
+        return None;
+    }
+
+    if ctx.effects().iter().any(is_deliberate_self_target_rider) {
+        return None;
+    }
+
+    if slot_polarity(ctx, targeted_object_impact(ctx, object_id)) != EffectPolarity::Harmful {
+        return None;
+    }
+
+    current_target_selection_targets(ctx.state)?
+        .iter()
+        .any(|target| match target {
+            TargetRef::Object(id) => ctx.state.objects.get(id).is_some_and(|object| {
+                players::is_opponent(ctx.state, ctx.ai_player, object.controller)
+            }),
+            TargetRef::Player(_) => false,
+        })
+        .then(|| PolicyReason::new("anti_self_harm_own_permanent_with_opponent_target"))
+}
+
+/// CR 601.2b + CR 700.2a: a mode is chosen while the spell is being cast (or
+/// the ability put on the stack), one step BEFORE targets. Since
+/// [`PolicyContext::effects`] now reports exactly the modes a `SelectModes`
+/// candidate commits to, the same three-way [`slot_polarity`] ladder the target
+/// arms use can price the branch itself: penalise a harmful mode whose own
+/// target filter describes nothing but the AI's own board. Witherbloom Charm
+/// chose "Destroy target nonland permanent with mana value 2 or less" while its
+/// own Signet was the only permanent matching that filter.
+///
+/// A soft penalty, not a Reject. The engine has already removed modes with no
+/// legal target at all (`filter_modes_by_target_legality`, CR 700.2a), so this
+/// mode IS playable, and a modal card whose every mode is poor still has to
+/// pick one — the veto belongs at the target step
+/// ([`own_permanent_with_opponent_alternative`]), where an alternative exists.
+///
+/// Root-only, and card-local by construction: one `state.battlefield` property
+/// scan per selected harmful mode, never `find_legal_targets`. The question is
+/// "does this filter describe anything an opponent controls", not target
+/// legality — hexproof and friends are the target step's business.
+fn score_selected_modes(ctx: &PolicyContext<'_>) -> f64 {
+    if !ctx.at_root() {
+        return 0.0;
+    }
+
+    let effects = ctx.effects();
+    if effects.iter().any(is_deliberate_self_target_rider) {
+        return 0.0;
+    }
+    if slot_polarity(ctx, None) != EffectPolarity::Harmful {
+        return 0.0;
+    }
+
+    let Some(source) = ctx.source_object() else {
+        return 0.0;
+    };
+    let filter_ctx = FilterContext::from_source(ctx.state, source.id);
+
+    let only_own_board = effects
+        .iter()
+        .filter(|effect| matches!(effect_polarity(effect), EffectPolarity::Harmful))
+        .filter_map(|effect| extract_target_filter(effect))
+        .filter(|filter| filter_is_object_population(filter))
+        .filter(|filter| filter_can_reach_an_opponent(filter))
+        .any(|filter| filter_reaches_only_own_permanents(ctx, filter, &filter_ctx));
+
+    if only_own_board {
+        ctx.penalties().wasted_cast_penalty
+    } else {
+        0.0
+    }
+}
+
+/// CR 115.4: an "any target" / player-reference filter can still be aimed at an
+/// opponent, so a battlefield scan is NOT the whole legal-target space for it
+/// and a mode carrying one is never "own board only". Only a filter whose every
+/// leaf is a typed object population can be answered by scanning permanents.
+fn filter_is_object_population(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(_) => true,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(filter_is_object_population)
+        }
+        _ => false,
+    }
+}
+
+/// A filter that names only the AI's own permanents (`controller: You`) can
+/// never match an opponent's board, so "no opponent matched" is vacuously true
+/// for it and every such mode would be penalised unconditionally: Orzhov Charm's
+/// self-bounce, Light the Way, Paths of Tuinvale, Alley Evasion, You're Ambushed
+/// on the Road, Airbender's Reversal, Clash of the Eikons, Nexus Mentality.
+/// Aiming a "harmful" effect at your own board IS the mode there. Mirrors the
+/// `controller: You` exclusion [`is_hostile_or_neutral_bounce`] applies for
+/// `score_pre_cast`.
+fn filter_can_reach_an_opponent(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => !matches!(
+            typed.controller,
+            Some(engine::types::ability::ControllerRef::You)
+        ),
+        // Every conjunct must be satisfiable by an opponent's permanent.
+        TargetFilter::And { filters } => filters.iter().all(filter_can_reach_an_opponent),
+        TargetFilter::Or { filters } => filters.iter().any(filter_can_reach_an_opponent),
+        // Unreachable through `filter_is_object_population`, which admits only
+        // the three arms above; conservative for any future caller.
+        _ => false,
+    }
+}
+
+/// True when at least one permanent the AI controls matches `filter` and no
+/// permanent an opponent controls does. A teammate's permanent counts as
+/// neither, so a filter reaching only a teammate's board stands the penalty
+/// down rather than guessing at team politics.
+fn filter_reaches_only_own_permanents(
+    ctx: &PolicyContext<'_>,
+    filter: &TargetFilter,
+    filter_ctx: &FilterContext<'_>,
+) -> bool {
+    let mut reaches_own = false;
+    for &id in ctx.state.battlefield.iter() {
+        let Some(object) = ctx.state.objects.get(&id) else {
+            continue;
+        };
+        if !matches_target_filter(ctx.state, id, filter, filter_ctx) {
+            continue;
+        }
+        if players::is_opponent(ctx.state, ctx.ai_player, object.controller) {
+            return false;
+        }
+        reaches_own |= object.controller == ctx.ai_player;
+    }
+    reaches_own
+}
+
 fn target_reject_reason(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<PolicyReason> {
     match target {
         TargetRef::Player(player_id) => {
@@ -581,21 +938,32 @@ fn target_reject_reason(ctx: &PolicyContext<'_>, target: &TargetRef) -> Option<P
                 }
             }
 
-            let player_impact = targeted_player_impact(ctx, *player_id)
-                .unwrap_or_else(|| aggregate_player_impact(ctx));
-            let prefers_self = if player_impact > 0.25 {
-                true
-            } else if player_impact < -0.25 {
-                false
-            } else {
-                beneficial
-            };
+            let prefers_self =
+                slot_is_beneficial(ctx, targeted_player_impact(ctx, *player_id), beneficial);
 
             (prefers_self != is_self)
                 .then(|| PolicyReason::new("anti_self_harm_wrong_player_target"))
         }
-        TargetRef::Object(object_id) => target_is_sacrificed_source(ctx, *object_id)
-            .then(|| PolicyReason::new("anti_self_harm_sacrificed_source_target")),
+        TargetRef::Object(object_id) => {
+            if target_is_sacrificed_source(ctx, *object_id) {
+                return Some(PolicyReason::new("anti_self_harm_sacrificed_source_target"));
+            }
+
+            if let Some(reason) = own_permanent_with_opponent_alternative(ctx, *object_id) {
+                return Some(reason);
+            }
+
+            let source = ctx.source_object()?;
+            let target = ctx.state.objects.get(object_id)?;
+            (source
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura")
+                && matches!(aura_polarity(source), EffectPolarity::Beneficial)
+                && target.controller != ctx.ai_player)
+                .then(|| PolicyReason::new("anti_self_harm_beneficial_aura_opponent_target"))
+        }
     }
 }
 
@@ -646,7 +1014,7 @@ fn score_target_ref(ctx: &PolicyContext<'_>, target: &TargetRef) -> f64 {
         }
         TargetRef::Object(object_id) => {
             let object_beneficial =
-                targeted_object_impact(ctx, *object_id).map_or(beneficial, |impact| impact > 0.25);
+                slot_is_beneficial(ctx, targeted_object_impact(ctx, *object_id), beneficial);
             score_target_object(ctx, *object_id, object_beneficial)
         }
     }
@@ -696,22 +1064,24 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
     {
         if object.tapped {
             score += if object.controller == ctx.ai_player {
-                8.0
+                ctx.penalties().untap_own_tapped_bonus
             } else {
-                -20.0
+                ctx.penalties().untap_opponent_tapped_penalty
             };
         } else {
-            score -= 6.0;
+            score += ctx.penalties().untap_untapped_penalty;
         }
     }
 
-    if ctx
+    if let Some(copy_effect) = ctx
         .effects()
         .iter()
-        .any(|effect| matches!(effect, Effect::CopyTokenOf { .. }))
+        .find(|effect| matches!(effect, Effect::CopyTokenOf { .. }))
     {
         if let Some(source) = ctx.source_object() {
-            score -= copy_target_penalties(ctx.state, ctx.ai_player, Some(source.id), object);
+            let strips = copy_effect_strips_legendary(copy_effect);
+            score -=
+                copy_target_penalties(ctx.state, ctx.ai_player, Some(source.id), object, strips);
         }
     }
 
@@ -768,42 +1138,6 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
                 }
             }
 
-            // Price the cost of an *affordable* ward (must pay an extra cost).
-            // An unaffordable ward is hard-rejected upstream by `tactical_gate`
-            // (CR 702.21a — the spell would just be countered), so this judgment
-            // layer never double-scores that case.
-            for keyword in &object.keywords {
-                if let Keyword::Ward(ward_cost) = keyword {
-                    if !can_pay_ward_cost(ctx, ward_cost) {
-                        break;
-                    }
-                    let severity = match ward_cost {
-                        WardCost::Mana(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
-                        WardCost::PayLife(amount) => (*amount as f64 / 3.0).min(2.0),
-                        WardCost::DiscardCard => 1.5,
-                        WardCost::Sacrifice { count, .. } => *count as f64 * 2.0,
-                        WardCost::Waterbend(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
-                        // CR 702.21a: Compound costs sum severity of components.
-                        WardCost::Compound(costs) => costs
-                            .iter()
-                            .map(|c| match c {
-                                WardCost::Mana(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
-                                WardCost::PayLife(amount) => (*amount as f64 / 3.0).min(2.0),
-                                WardCost::DiscardCard => 1.5,
-                                WardCost::Sacrifice { count, .. } => *count as f64 * 2.0,
-                                WardCost::Waterbend(cost) => {
-                                    (cost.mana_value() as f64 / 2.0).min(2.0)
-                                }
-                                WardCost::Compound(_) => 2.0,
-                            })
-                            .sum::<f64>()
-                            .min(4.0),
-                    };
-                    score += ctx.penalties().ward_cost_penalty_base * severity;
-                    break;
-                }
-            }
-
             // Removal quality mismatch: penalize premium removal on cheap targets
             if let Some(source) = ctx.source_object() {
                 let spell_mv = source.mana_cost.mana_value();
@@ -828,7 +1162,7 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
                     .is_some_and(|(dmg, t)| dmg >= t - object.damage_marked as i32);
                 let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
                 if !is_lethal_burn && !is_destroy {
-                    score -= 5.0;
+                    score += ctx.penalties().tapped_removal_no_urgency_penalty;
                 }
             }
         }
@@ -867,11 +1201,118 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
         {
             // Planeswalkers are high-priority removal targets
             object.mana_cost.mana_value() as f64 + 2.0
+        } else if object.card_types.core_types.contains(&CoreType::Land) {
+            // A land has no mana cost, so its mana value (CR 202.3)
+            // is 0 and the mana-value proxy below would price destroying one at
+            // nothing — leaving "Beast Within my own Forest" scored at the bare
+            // `controller_delta * 2.0`. `card_value::intrinsic_value` is the
+            // crate's single authority for a permanent's worth as a card and
+            // already prices a land by its mana development; reuse it rather
+            // than inventing a second land constant. The `controller_delta`
+            // multiplier below keeps the sign, so this is a magnitude floor for
+            // either controller's land.
+            intrinsic_value(ctx.state, object_id)
         } else {
             // Artifacts/enchantments: scale by mana value (capped)
             (object.mana_cost.mana_value() as f64).min(6.0)
         };
         score += controller_delta * noncreature_value;
+    }
+
+    // Price the cost of an *affordable* ward (must pay an extra cost). Applies to every
+    // permanent type, not just creatures — a Ward-bearing artifact/enchantment/planeswalker
+    // is exactly as real a target-choice cost as a Ward-bearing creature. An unaffordable ward
+    // is hard-rejected upstream by `tactical_gate` (CR 702.21a — the spell would just be
+    // countered), so this judgment layer never double-scores that case.
+    if !beneficial {
+        for keyword in &object.keywords {
+            if let Keyword::Ward(ward_cost) = keyword {
+                if !can_pay_ward_cost(ctx, ward_cost, object) {
+                    break;
+                }
+                let severity = match ward_cost {
+                    WardCost::Mana(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
+                    WardCost::PayLife(amount) => (*amount as f64 / 3.0).min(2.0),
+                    WardCost::PayLifeEqualToPower => {
+                        (object.power.unwrap_or(0).max(0) as f64 / 3.0).min(2.0)
+                    }
+                    WardCost::DiscardCard => 1.5,
+                    WardCost::Sacrifice { count, .. } => *count as f64 * 2.0,
+                    WardCost::Waterbend(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
+                    // CR 702.21a + CR 122.1 + CR 728.1: giving yourself
+                    // player counters has an explicit, kind-specific
+                    // valuation — no wildcard fallback, so a future
+                    // supported counter kind forces a deliberate
+                    // decision here. A lethal poison payment never
+                    // reaches this scoring at all — `can_pay_ward_cost`
+                    // above already rejects it (reframed as "can't
+                    // rationally pay"), so the Poison arm only ever sees
+                    // sub-lethal, ordinary-severity payments.
+                    WardCost::GetPlayerCounters {
+                        counter_kind: engine::types::player::PlayerCounterKind::Poison,
+                        count,
+                    } => *count as f64 * 3.0,
+                    // CR 728.1: each rad counter mills a card and, if that
+                    // card is nonland, costs 1 life. Real cost, not
+                    // harmless — approximated as PayLife's per-life
+                    // severity (amount/3.0) scaled by ~0.6 (typical
+                    // nonland fraction of a deck), i.e. ~0.2 per counter.
+                    WardCost::GetPlayerCounters {
+                        counter_kind: engine::types::player::PlayerCounterKind::Rad,
+                        count,
+                    } => (*count as f64 * 0.2).min(2.0),
+                    // Experience/ticket counters carry no loss-condition
+                    // or resource-drain risk — purely beneficial or
+                    // neutral to receive.
+                    WardCost::GetPlayerCounters {
+                        counter_kind: engine::types::player::PlayerCounterKind::Experience,
+                        ..
+                    } => 0.0,
+                    WardCost::GetPlayerCounters {
+                        counter_kind: engine::types::player::PlayerCounterKind::Ticket,
+                        ..
+                    } => 0.0,
+                    // CR 702.21a: Compound costs sum severity of components.
+                    // A Compound containing a lethal poison sub-cost is
+                    // also already rejected upstream by `can_pay_ward_cost`
+                    // (which requires every sub-cost payable), so this
+                    // fold only ever sees payable compounds.
+                    WardCost::Compound(costs) => costs
+                        .iter()
+                        .map(|c| match c {
+                            WardCost::Mana(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
+                            WardCost::PayLife(amount) => (*amount as f64 / 3.0).min(2.0),
+                            WardCost::PayLifeEqualToPower => {
+                                (object.power.unwrap_or(0).max(0) as f64 / 3.0).min(2.0)
+                            }
+                            WardCost::DiscardCard => 1.5,
+                            WardCost::Sacrifice { count, .. } => *count as f64 * 2.0,
+                            WardCost::Waterbend(cost) => (cost.mana_value() as f64 / 2.0).min(2.0),
+                            WardCost::GetPlayerCounters {
+                                counter_kind: engine::types::player::PlayerCounterKind::Poison,
+                                count,
+                            } => *count as f64 * 3.0,
+                            WardCost::GetPlayerCounters {
+                                counter_kind: engine::types::player::PlayerCounterKind::Rad,
+                                count,
+                            } => (*count as f64 * 0.2).min(2.0),
+                            WardCost::GetPlayerCounters {
+                                counter_kind: engine::types::player::PlayerCounterKind::Experience,
+                                ..
+                            } => 0.0,
+                            WardCost::GetPlayerCounters {
+                                counter_kind: engine::types::player::PlayerCounterKind::Ticket,
+                                ..
+                            } => 0.0,
+                            WardCost::Compound(_) => 2.0,
+                        })
+                        .sum::<f64>()
+                        .min(4.0),
+                };
+                score += ctx.penalties().ward_cost_penalty_base * severity;
+                break;
+            }
+        }
     }
 
     score
@@ -944,6 +1385,10 @@ fn pump_taps_blocker_penalty(ctx: &PolicyContext<'_>) -> f64 {
     // Non-land, non-creature tier-1 sources (mana rocks) that auto_tap would use
     // before creatures. Exclude sacrifice-for-mana sources (Treasures) — those are
     // tier 4 in auto_tap and would NOT be tapped before creature dorks.
+    // CR 701.21: the exclusion is `mana_abilities::is_renewable_mana_ability`, the
+    // single engine authority. The local copy this replaced matched only a
+    // `Composite` cost, so a Gold token (bare `Sacrifice`) defeated the stated
+    // intent and was counted as a renewable tier-1 rock.
     let non_creature_tier1_count = ctx
         .state
         .battlefield
@@ -954,9 +1399,10 @@ fn pump_taps_blocker_penalty(ctx: &PolicyContext<'_>) -> f64 {
                     && !obj.tapped
                     && !obj.card_types.core_types.contains(&CoreType::Land)
                     && !obj.card_types.core_types.contains(&CoreType::Creature)
-                    && obj.abilities.iter().any(|a| {
-                        mana_abilities::is_mana_ability(a) && !ability_cost_requires_sacrifice(a)
-                    })
+                    && obj
+                        .abilities
+                        .iter()
+                        .any(mana_abilities::is_renewable_mana_ability)
             })
         })
         .count();
@@ -969,21 +1415,6 @@ fn pump_taps_blocker_penalty(ctx: &PolicyContext<'_>) -> f64 {
 
     // Each creature tapped loses its blocking value during this combat.
     -(5.0 * creatures_tapped as f64)
-}
-
-/// Check if an ability's cost includes self-sacrifice (Treasure-style `{T}, Sacrifice`).
-/// Mirrors `mana_sources::cost_requires_sacrifice` which is private to the engine module.
-fn ability_cost_requires_sacrifice(ability: &engine::types::ability::AbilityDefinition) -> bool {
-    match &ability.cost {
-        Some(AbilityCost::Composite { costs }) => costs.iter().any(|c| {
-            matches!(
-                c,
-                AbilityCost::Sacrifice(cost)
-                    if matches!(cost.target, TargetFilter::SelfRef)
-            )
-        }),
-        _ => false,
-    }
 }
 
 /// Extract the fixed damage amount from the pending spell's DealDamage effect.
@@ -1038,29 +1469,318 @@ mod tests {
     use super::*;
     use crate::config::AiConfig;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
+    use engine::game::ability_utils::build_resolved_from_def;
+    use engine::game::combat::AttackTarget;
     use engine::game::zones::create_object;
+    use engine::parser::oracle::parse_oracle_text;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, BounceSelection, CardSelectionMode,
-        ContinuousModification, ControllerRef, DiscardSelfScope, FilterProp, PtValue, QuantityRef,
-        ReplacementDefinition, ResolvedAbility, SacrificeCost, StaticDefinition, TargetFilter,
-        TriggerDefinition, TypeFilter, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, AdditionalCost, AdditionalCostRepeatability,
+        BounceSelection, CardSelectionMode, ContinuousModification, ControllerRef,
+        DiscardSelfScope, EffectKind, FilterProp, ModalChoice, PtValue, QuantityModification,
+        QuantityRef, ReplacementDefinition, ResolvedAbility, SacrificeCost, StaticCondition,
+        StaticDefinition, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
+        UnlessPayScaling,
     };
     use engine::types::game_state::{
-        CastingVariant, GameState, PendingCast, TargetSelectionSlot, WaitingFor,
+        CastingVariant, GameState, PendingCast, TargetEffectDetail, TargetSelectionProgress,
+        TargetSelectionSlot, WaitingFor,
     };
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::keywords::Keyword;
-    use engine::types::mana::ManaCost;
+    use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
     use engine::types::player::PlayerId;
     use engine::types::replacements::ReplacementEvent;
     use engine::types::statics::StaticMode;
-    use engine::types::triggers::TriggerMode;
+    use engine::types::triggers::{AttackTargetFilter, TriggerMode};
     use engine::types::zones::Zone;
 
     fn make_state() -> GameState {
         let mut state = GameState::new_two_player(42);
         state.turn_number = 2;
         state
+    }
+
+    fn live_additional_cost_candidate(
+        additional_cost: AdditionalCost,
+        pay: bool,
+    ) -> (GameState, CandidateAction) {
+        let mut state = make_state();
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.players[0].life = 2;
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_001),
+            PlayerId(0),
+            "Optional life-cost specimen".to_string(),
+            Zone::Hand,
+        );
+        let spell = state.objects.get_mut(&spell_id).unwrap();
+        spell.card_types.core_types.push(CoreType::Creature);
+        spell.mana_cost = ManaCost::zero();
+        spell.additional_cost = Some(additional_cost);
+
+        engine::game::apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell_id,
+                card_id: CardId(90_001),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+        .expect("the real cast must enter OptionalCostChoice");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::OptionalCostChoice { .. }
+        ));
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::DecideOptionalCost { pay: selected } if selected == pay)
+            })
+            .expect("the generated candidate set must contain the selected optional-cost action");
+        (state, candidate)
+    }
+
+    fn optional_life_cost() -> AdditionalCost {
+        AdditionalCost::Optional {
+            cost: AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
+            repeatability: AdditionalCostRepeatability::Once,
+        }
+    }
+
+    fn live_defiler_candidate(life: i32, pay: bool) -> (GameState, CandidateAction) {
+        live_defiler_candidate_with_mana_cost(life, pay, ManaCost::zero())
+    }
+
+    fn live_defiler_candidate_with_mana_cost(
+        life: i32,
+        pay: bool,
+        mana_cost: ManaCost,
+    ) -> (GameState, CandidateAction) {
+        let payment_mode = if mana_cost.mana_value() > 0 {
+            CastPaymentMode::Manual
+        } else {
+            CastPaymentMode::Auto
+        };
+        let mut state = make_state();
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.players[0].life = life;
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_002),
+            PlayerId(0),
+            "Defiler-proof green permanent".to_string(),
+            Zone::Hand,
+        );
+        let spell = state.objects.get_mut(&spell_id).unwrap();
+        spell.card_types.core_types.push(CoreType::Creature);
+        spell.color = vec![ManaColor::Green];
+        spell.mana_cost = mana_cost;
+
+        let defiler_id = create_object(
+            &mut state,
+            CardId(90_003),
+            PlayerId(0),
+            "Defiler of Vigor".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&defiler_id)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::DefilerCostReduction {
+                color: ManaColor::Green,
+                life_cost: 2,
+                mana_reduction: ManaCost::Cost {
+                    shards: vec![ManaCostShard::Green],
+                    generic: 0,
+                },
+            }));
+
+        engine::game::apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell_id,
+                card_id: CardId(90_002),
+                targets: Vec::new(),
+                payment_mode,
+            },
+        )
+        .expect("the real green permanent cast must enter DefilerPayment");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::DefilerPayment { .. }
+        ));
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::DecideOptionalCost { pay: selected } if selected == pay)
+            })
+            .expect("the generated candidate set must contain the selected Defiler decision");
+        (state, candidate)
+    }
+
+    /// Builds a real keyword-generated repeatable queue, then substitutes the
+    /// test-only life branch while preserving the queue origin and ordinal. No
+    /// printed repeatable keyword presently has a direct `PayLife` cost; Squad
+    /// is the production queue carrier this regression protects.
+    fn live_queued_repeatable_life_candidate() -> (GameState, CandidateAction) {
+        let mut state = make_state();
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        state.players[0].life = 2;
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_004),
+            PlayerId(0),
+            "Queued repeatable-cost specimen".to_string(),
+            Zone::Hand,
+        );
+        let spell = state.objects.get_mut(&spell_id).unwrap();
+        spell.card_types.core_types.push(CoreType::Creature);
+        spell.mana_cost = ManaCost::zero();
+        spell.keywords.push(Keyword::Squad(ManaCost::zero()));
+
+        engine::game::apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell_id,
+                card_id: CardId(90_004),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+        .expect("the real Squad cast must enter its queued optional-cost prompt");
+
+        let life_cost = optional_life_cost();
+        let WaitingFor::OptionalCostChoice {
+            cost, pending_cast, ..
+        } = &mut state.waiting_for
+        else {
+            panic!("expected the keyword-generated queued OptionalCostChoice");
+        };
+        assert!(matches!(
+            pending_cast.additional_cost_queue.first(),
+            Some(instance)
+                if instance.origin == engine::types::ability::AdditionalCostOrigin::Squad
+                    && matches!(
+                        instance.cost,
+                        AdditionalCost::Optional {
+                            repeatability: AdditionalCostRepeatability::Repeatable,
+                            ..
+                        }
+                    )
+        ));
+        *cost = life_cost.clone();
+        pending_cast.additional_cost_queue[0].cost = life_cost;
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| {
+                matches!(
+                    candidate.action,
+                    GameAction::DecideOptionalCost { pay: true }
+                )
+            })
+            .expect("the queued prompt must generate its accept candidate");
+        (state, candidate)
+    }
+
+    fn install_norns_annex_style_tax(state: &mut GameState) {
+        let tax_id = create_object(
+            state,
+            CardId(90_005),
+            PlayerId(1),
+            "Norn's Annex proof".to_string(),
+            Zone::Battlefield,
+        );
+        let tax = state.objects.get_mut(&tax_id).unwrap();
+        tax.card_types.core_types.push(CoreType::Artifact);
+        let mut definition = StaticDefinition::new(StaticMode::CantAttack)
+            .affected(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Creature],
+                controller: Some(ControllerRef::Opponent),
+                properties: Vec::new(),
+            }))
+            .description("Norn's Annex proof".to_string());
+        definition.condition = Some(StaticCondition::UnlessPay {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::PhyrexianWhite],
+                generic: 0,
+            },
+            scaling: UnlessPayScaling::PerAffectedCreature,
+            defended: Some(AttackTargetFilter::Player),
+        });
+        tax.static_definitions.push(definition);
+    }
+
+    fn install_life_loss_replacements(
+        state: &mut GameState,
+        replacements: Vec<ReplacementDefinition>,
+    ) {
+        let source = create_object(
+            state,
+            CardId(90_006),
+            PlayerId(0),
+            "Life-loss replacement proof".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .replacement_definitions = replacements.into();
+    }
+
+    fn post_mutation_life_loss_modifier() -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::LoseLife)
+            .quantity_modification(QuantityModification::Plus { value: 0 })
+    }
+
+    fn shared_registry_verdicts_for(
+        state: &GameState,
+        candidate: &CandidateAction,
+    ) -> Vec<(PolicyId, PolicyVerdict)> {
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: engine::ai_support::candidate_actions(state),
+        };
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        crate::policies::registry::PolicyRegistry::shared().verdicts(&ctx)
     }
 
     fn add_creature(
@@ -1098,41 +1818,71 @@ mod tests {
         id
     }
 
-    fn make_target_selection_ctx(
-        _state: &GameState,
-        effect: Effect,
+    /// Installs a single-slot target-selection prompt on `state` AND hands back
+    /// the matching decision context. Both halves are required: production
+    /// always builds the decision by cloning `state.waiting_for`
+    /// (`ai_support::build_decision_context`), and the slot-local self-harm veto
+    /// reads the current slot through the engine's own
+    /// `current_target_selection_targets(state)` authority — a fixture that set
+    /// only the decision would silently make that read unreachable.
+    fn install_target_selection_ctx(
+        state: &mut GameState,
+        ability: ResolvedAbility,
+        source_id: ObjectId,
+        card_id: CardId,
         legal_targets: Vec<TargetRef>,
         candidate_target: Option<TargetRef>,
     ) -> (AiDecisionContext, CandidateAction) {
-        let ability = ResolvedAbility::new(effect, Vec::new(), ObjectId(100), PlayerId(0));
-        let pending_cast = PendingCast::new(ObjectId(100), CardId(100), ability, ManaCost::zero());
-        let decision = AiDecisionContext {
-            waiting_for: WaitingFor::TargetSelection {
-                player: PlayerId(0),
-                pending_cast: Box::new(pending_cast),
-                target_slots: vec![TargetSelectionSlot {
-                    legal_targets,
-                    optional: false,
-                }],
-                mode_labels: Vec::new(),
-                selection: Default::default(),
+        let pending_cast = PendingCast::new(source_id, card_id, ability, ManaCost::zero());
+        state.waiting_for = WaitingFor::TargetSelection {
+            player: PlayerId(0),
+            pending_cast: Box::new(pending_cast),
+            target_slots: vec![TargetSelectionSlot {
+                legal_targets: legal_targets.clone(),
+                optional: false,
+                chooser: None,
+                effect_kind: EffectKind::NoOp,
+                effect_detail: TargetEffectDetail::None,
+            }],
+            mode_labels: Vec::new(),
+            selection: TargetSelectionProgress {
+                current_slot: 0,
+                selected_slots: Vec::new(),
+                current_legal_targets: legal_targets,
             },
+        };
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
             candidates: Vec::new(),
         };
         let candidate = CandidateAction {
             action: GameAction::ChooseTarget {
                 target: candidate_target,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         (decision, candidate)
     }
 
+    fn make_target_selection_ctx(
+        state: &mut GameState,
+        effect: Effect,
+        legal_targets: Vec<TargetRef>,
+        candidate_target: Option<TargetRef>,
+    ) -> (AiDecisionContext, CandidateAction) {
+        let ability = ResolvedAbility::new(effect, Vec::new(), ObjectId(100), PlayerId(0));
+        install_target_selection_ctx(
+            state,
+            ability,
+            ObjectId(100),
+            CardId(100),
+            legal_targets,
+            candidate_target,
+        )
+    }
+
     fn make_mutate_target_selection_ctx(
-        state: &GameState,
+        state: &mut GameState,
         legal_targets: Vec<TargetRef>,
         candidate_target: Option<TargetRef>,
     ) -> (AiDecisionContext, CandidateAction) {
@@ -1144,8 +1894,10 @@ mod tests {
             legal_targets,
             candidate_target,
         );
-        if let WaitingFor::TargetSelection { pending_cast, .. } = &mut decision.waiting_for {
-            pending_cast.casting_variant = CastingVariant::Mutate;
+        for waiting_for in [&mut decision.waiting_for, &mut state.waiting_for] {
+            if let WaitingFor::TargetSelection { pending_cast, .. } = waiting_for {
+                pending_cast.casting_variant = CastingVariant::Mutate;
+            }
         }
         (decision, candidate)
     }
@@ -1216,10 +1968,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         (decision, candidate)
     }
@@ -1239,6 +1988,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -1278,6 +2028,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -1285,6 +2036,223 @@ mod tests {
         assert!(
             score > -1.0,
             "Matching graveyard target should avoid ETB whiff penalty, got {score}"
+        );
+    }
+
+    /// Clone-class shell in hand: a printed 0/T body plus an "enters as a copy"
+    /// replacement. Phantasmal Image, Clone, Phyrexian Metamorph, Body Double
+    /// and The Mimeoplasm all parse to this shape (card-data verified); only the
+    /// copy filter and the printed toughness differ.
+    fn enter_as_copy_creature(
+        state: &mut GameState,
+        name: &str,
+        copy_filter: TargetFilter,
+        printed_toughness: i32,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.power = Some(0);
+        obj.toughness = Some(printed_toughness);
+        obj.base_power = Some(0);
+        obj.base_toughness = Some(printed_toughness);
+        obj.replacement_definitions.push(
+            ReplacementDefinition::new(ReplacementEvent::Moved)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::BecomeCopy {
+                        target: copy_filter,
+                        recipient: TargetFilter::SelfRef,
+                        duration: None,
+                        mana_value_limit: None,
+                        additional_modifications: Vec::new(),
+                    },
+                ))
+                .valid_card(TargetFilter::SelfRef)
+                .destination_zone(Zone::Battlefield),
+        );
+        id
+    }
+
+    fn score_cast_candidate(state: &GameState, spell_id: ObjectId) -> f64 {
+        let config = AiConfig::default();
+        let (decision, candidate) = make_cast_spell_decision(state, spell_id);
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        AntiSelfHarmPolicy.score(&ctx)
+    }
+
+    #[test]
+    fn clone_with_no_creature_on_battlefield_is_penalised() {
+        let mut state = make_state();
+        let spell_id = enter_as_copy_creature(
+            &mut state,
+            "Phantasmal Image",
+            TargetFilter::Typed(TypedFilter::creature()),
+            0,
+        );
+
+        let score = score_cast_candidate(&state, spell_id);
+
+        assert!(
+            score < -5.0,
+            "A 0/0 clone with nothing to copy enters as a 0/0 and dies (CR 704.5f), got {score}"
+        );
+    }
+
+    #[test]
+    fn clone_with_a_creature_on_battlefield_is_not() {
+        let mut state = make_state();
+        // Copying is a choice, not targeting — an opponent's hexproof creature
+        // is a perfectly legal copy source.
+        let opponent = add_creature(&mut state, PlayerId(1), "Hexproof Bear", 2, 2);
+        state
+            .objects
+            .get_mut(&opponent)
+            .unwrap()
+            .keywords
+            .push(Keyword::Hexproof);
+        let spell_id = enter_as_copy_creature(
+            &mut state,
+            "Phantasmal Image",
+            TargetFilter::Typed(TypedFilter::creature()),
+            0,
+        );
+
+        let score = score_cast_candidate(&state, spell_id);
+
+        assert!(
+            score > -1.0,
+            "An opponent's hexproof creature is a legal copy source, got {score}"
+        );
+    }
+
+    #[test]
+    fn clone_filter_respects_type() {
+        let mut state = make_state();
+        let artifact_card = CardId(state.next_object_id);
+        let artifact = create_object(
+            &mut state,
+            artifact_card,
+            PlayerId(1),
+            "Sol Ring".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&artifact)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+
+        // Phyrexian Metamorph copies "any artifact or creature".
+        let metamorph_id = enter_as_copy_creature(
+            &mut state,
+            "Phyrexian Metamorph",
+            TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+                    TargetFilter::Typed(TypedFilter::creature()),
+                ],
+            },
+            0,
+        );
+        let clone_id = enter_as_copy_creature(
+            &mut state,
+            "Clone",
+            TargetFilter::Typed(TypedFilter::creature()),
+            0,
+        );
+
+        let metamorph_score = score_cast_candidate(&state, metamorph_id);
+        let clone_score = score_cast_candidate(&state, clone_id);
+
+        assert!(
+            metamorph_score > -1.0,
+            "An artifact satisfies the artifact-or-creature copy filter, got {metamorph_score}"
+        );
+        assert!(
+            clone_score < -5.0,
+            "The same board has no creature for a creature-only copy filter, got {clone_score}"
+        );
+    }
+
+    #[test]
+    fn bodied_clone_with_no_copy_source_is_not_penalised() {
+        let mut state = make_state();
+        // Sakashima the Impostor / Hulking Metamorph class: a printed body that
+        // survives entering without a copy source, so CR 704.5f never fires.
+        let spell_id = enter_as_copy_creature(
+            &mut state,
+            "Sakashima the Impostor",
+            TargetFilter::Typed(TypedFilter::creature()),
+            1,
+        );
+
+        let score = score_cast_candidate(&state, spell_id);
+
+        assert!(
+            score > -1.0,
+            "A bodied clone survives an un-copied entry, got {score}"
+        );
+    }
+
+    #[test]
+    fn body_double_with_only_battlefield_creatures_is_penalised() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(1), "Grizzly Bears", 2, 2);
+        let mut graveyard_creature = TypedFilter::creature();
+        graveyard_creature.properties.push(FilterProp::InZone {
+            zone: Zone::Graveyard,
+        });
+        let spell_id = enter_as_copy_creature(
+            &mut state,
+            "Body Double",
+            TargetFilter::Typed(graveyard_creature),
+            0,
+        );
+
+        let score = score_cast_candidate(&state, spell_id);
+
+        assert!(
+            score < -5.0,
+            "Body Double copies a creature card in a GRAVEYARD; a battlefield \
+             creature is not a legal source, got {score}"
+        );
+    }
+
+    #[test]
+    fn mimeoplasm_shape_is_never_penalised() {
+        let mut state = make_state();
+        let spell_id = enter_as_copy_creature(
+            &mut state,
+            "The Mimeoplasm",
+            TargetFilter::ExiledCardByIndex { index: 0 },
+            0,
+        );
+
+        let score = score_cast_candidate(&state, spell_id);
+
+        assert!(
+            score > -1.0,
+            "The Mimeoplasm's copy source only exists after its exile cost is \
+             paid, so it can never be pre-judged a whiff, got {score}"
         );
     }
 
@@ -1303,7 +2271,7 @@ mod tests {
 
         // Score targeting own creature
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(own_id)),
@@ -1316,12 +2284,13 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_own = AntiSelfHarmPolicy.score(&ctx_own);
 
         // Score targeting opponent's creature
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(opp_id)),
@@ -1334,6 +2303,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -1349,6 +2319,569 @@ mod tests {
     }
 
     #[test]
+    fn undying_malice_prefers_own_creature() {
+        // Undying Malice grants target creature "when this dies, return it to the
+        // battlefield" — GenericEffect{ Continuous{ GrantTrigger{ dies →
+        // ChangeZone→Battlefield } } }. Pre-fix `modification_polarity(GrantTrigger)`
+        // fell to `Contextual`, so `player_impact`/`is_spell_beneficial` read the
+        // spell as non-beneficial and `score_target_object` aimed it at an opponent
+        // creature. The fix classifies the grant Beneficial (via the executed
+        // ChangeZone→Battlefield), flipping the preference to the AI's own creature.
+        // Reverting the named `GrantTrigger` arm makes `score_own < score_opp`.
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let config = AiConfig::default();
+
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+        trigger.execute = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        )));
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::GrantTrigger {
+                    trigger: Box::new(trigger),
+                }])],
+            target: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature))),
+            duration: None,
+            end_cost: None,
+        };
+
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            effect.clone(),
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(own_id)),
+        );
+        let ctx_own = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score_own = AntiSelfHarmPolicy.score(&ctx_own);
+
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            effect,
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(opp_id)),
+        );
+        let ctx_opp = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
+
+        assert!(
+            score_own > score_opp,
+            "Undying grant should prefer own creature: own={score_own}, opp={score_opp}"
+        );
+        assert!(score_own > 0.0, "Own creature score should be positive");
+        assert!(
+            score_opp < 0.0,
+            "Opponent creature score should be negative"
+        );
+    }
+
+    #[test]
+    fn strength_of_tajuru_prefers_own_creature() {
+        // VERIFY-ONLY (expected to PASS on unmodified code): Strength of the Tajuru's
+        // payoff leaf is `PutCounterAll{ +1/+1 }`, which `counter_sign_polarity`
+        // already classifies Beneficial, so `is_spell_beneficial` is true and
+        // `score_target_object` prefers the AI's own creature. No code change backs
+        // this — it documents the reported "targets opponent" behavior as already
+        // correct for the counter payoff (the empty `Typed` target mirrors the real
+        // leaf AST). If this ever fails, it is a stop-and-return item, not a fix.
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let config = AiConfig::default();
+
+        let effect = Effect::PutCounterAll {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::Typed(TypedFilter::default()),
+        };
+
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            effect.clone(),
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(own_id)),
+        );
+        let ctx_own = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score_own = AntiSelfHarmPolicy.score(&ctx_own);
+
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            effect,
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(opp_id)),
+        );
+        let ctx_opp = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
+
+        assert!(
+            score_own > score_opp,
+            "PutCounterAll{{+1/+1}} should prefer own creature: own={score_own}, opp={score_opp}"
+        );
+    }
+
+    /// The shipped parse of a real card's Oracle text. Fixtures below assert
+    /// against this rather than a hand-written AST, so a parser shape change
+    /// fails them instead of leaving them green on a shape no card produces.
+    fn parsed_abilities(
+        card_name: &str,
+        oracle_text: &str,
+        keywords: &[&str],
+        types: &[&str],
+    ) -> Vec<AbilityDefinition> {
+        let keywords: Vec<String> = keywords.iter().map(|k| (*k).to_string()).collect();
+        let types: Vec<String> = types.iter().map(|t| (*t).to_string()).collect();
+        parse_oracle_text(oracle_text, card_name, &keywords, &types, &[]).abilities
+    }
+
+    /// Put `definition` on the stack as an AI-controlled spell, offer
+    /// `legal_targets` at the current slot and return the policy verdict for
+    /// `candidate_target`.
+    fn target_verdict_for_definition(
+        state: &mut GameState,
+        card_name: &str,
+        definition: &AbilityDefinition,
+        legal_targets: Vec<TargetRef>,
+        candidate_target: TargetRef,
+    ) -> PolicyVerdict {
+        let source_id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            card_name.to_string(),
+            Zone::Stack,
+        );
+        let card_id = state.objects[&source_id].card_id;
+        let ability = build_resolved_from_def(definition, source_id, PlayerId(0));
+        let (decision, candidate) = install_target_selection_ctx(
+            state,
+            ability,
+            source_id,
+            card_id,
+            legal_targets,
+            Some(candidate_target),
+        );
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        AntiSelfHarmPolicy.verdict(&ctx)
+    }
+
+    fn reject_kind(verdict: &PolicyVerdict) -> Option<&'static str> {
+        match verdict {
+            PolicyVerdict::Reject { reason } => Some(reason.kind),
+            PolicyVerdict::Score { .. } => None,
+        }
+    }
+
+    fn score_delta(verdict: &PolicyVerdict) -> f64 {
+        match verdict {
+            PolicyVerdict::Score { delta, .. } => *delta,
+            PolicyVerdict::Reject { reason } => {
+                panic!("expected a scoring verdict, got Reject({})", reason.kind)
+            }
+        }
+    }
+
+    const BEAST_WITHIN_ORACLE: &str =
+        "Destroy target permanent. Its controller creates a 3/3 green Beast creature token.";
+
+    const REQUISITION_RAID_ORACLE: &str = "Spree (Choose one or more additional costs.)\n\
+         + {1} — Destroy target artifact.\n\
+         + {1} — Destroy target enchantment.\n\
+         + {1} — Put a +1/+1 counter on each creature target player controls.";
+
+    const TAJURU_ORACLE: &str =
+        "Multikicker {1} (You may pay an additional {1} any number of times as you cast this \
+         spell.)\nChoose target creature, then choose another target creature for each time this \
+         spell was kicked. Put X +1/+1 counters on each of them.";
+
+    #[test]
+    fn beast_within_own_land_rejected_when_opponent_permanent_is_legal() {
+        let mut state = make_state();
+        let own_forest = add_land(&mut state, PlayerId(0), "Forest", false);
+        let opponent_creature = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let abilities = parsed_abilities("Beast Within", BEAST_WITHIN_ORACLE, &[], &["Instant"]);
+        assert!(
+            matches!(*abilities[0].effect, Effect::Destroy { .. }),
+            "Beast Within must still parse as a Destroy: {:?}",
+            abilities[0].effect
+        );
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Beast Within",
+            &abilities[0],
+            vec![
+                TargetRef::Object(own_forest),
+                TargetRef::Object(opponent_creature),
+            ],
+            TargetRef::Object(own_forest),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_own_permanent_with_opponent_target"),
+            "destroying our own Forest while an opponent's creature is legal in the same slot \
+             must be vetoed, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn own_permanent_allowed_when_it_is_the_only_legal_target() {
+        let mut state = make_state();
+        let own_forest = add_land(&mut state, PlayerId(0), "Forest", false);
+        let abilities = parsed_abilities("Beast Within", BEAST_WITHIN_ORACLE, &[], &["Instant"]);
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Beast Within",
+            &abilities[0],
+            vec![TargetRef::Object(own_forest)],
+            TargetRef::Object(own_forest),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            None,
+            "with no opponent-controlled object in the slot the veto must stand down — an \
+             already-announced spell still has to pick something, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn red_elemental_blast_own_blue_permanent_rejected() {
+        let mut state = make_state();
+        let own_commander = add_creature(&mut state, PlayerId(0), "Blue Commander", 3, 3);
+        let opponent_permanent = add_creature(&mut state, PlayerId(1), "Blue Drake", 2, 2);
+        for id in [own_commander, opponent_permanent] {
+            state.objects.get_mut(&id).unwrap().color = vec![ManaColor::Blue];
+        }
+        let abilities = parsed_abilities(
+            "Red Elemental Blast",
+            "Choose one —\n• Counter target blue spell.\n• Destroy target blue permanent.",
+            &[],
+            &["Instant"],
+        );
+        let destroy_mode = abilities
+            .iter()
+            .find(|ability| matches!(*ability.effect, Effect::Destroy { .. }))
+            .expect("Red Elemental Blast must parse a 'destroy target blue permanent' mode");
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Red Elemental Blast",
+            destroy_mode,
+            vec![
+                TargetRef::Object(own_commander),
+                TargetRef::Object(opponent_permanent),
+            ],
+            TargetRef::Object(own_commander),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            Some("anti_self_harm_own_permanent_with_opponent_target"),
+            "blasting our own blue permanent while an opponent's is legal must be vetoed, \
+             got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn bouncing_our_own_creature_is_not_vetoed() {
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let abilities = parsed_abilities(
+            "Unsummon",
+            "Return target creature to its owner's hand.",
+            &[],
+            &["Instant"],
+        );
+        assert!(
+            matches!(*abilities[0].effect, Effect::Bounce { .. }),
+            "Unsummon must still parse as a Bounce: {:?}",
+            abilities[0].effect
+        );
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Unsummon",
+            &abilities[0],
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            TargetRef::Object(own_id),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            None,
+            "returning our own creature (an ETB re-buy or a rescue in response to removal) is a \
+             value play the veto must not categorically forbid, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn flickering_our_own_permanent_is_not_vetoed() {
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let abilities = parsed_abilities(
+            "Flicker",
+            "Exile target nontoken permanent, then return it to the battlefield under its \
+             owner's control.",
+            &[],
+            &["Instant"],
+        );
+
+        let verdict = target_verdict_for_definition(
+            &mut state,
+            "Flicker",
+            &abilities[0],
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            TargetRef::Object(own_id),
+        );
+
+        assert_eq!(
+            reject_kind(&verdict),
+            None,
+            "the exile leg of a flicker only looks harmful — the return leg makes our own \
+             permanent the intended target, got {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn own_land_removal_costs_at_least_the_land_card_value() {
+        let mut state = make_state();
+        let own_forest = add_land(&mut state, PlayerId(0), "Forest", false);
+        let land_value = intrinsic_value(&state, own_forest);
+        assert!(
+            land_value > 0.0,
+            "a land must carry a non-zero card value, got {land_value}"
+        );
+        let config = AiConfig::default();
+
+        // Only our own land is legal, so the slot-local veto stands down and the
+        // magnitude of the score itself is what is under test.
+        let (decision, candidate) = make_target_selection_ctx(
+            &mut state,
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(own_forest)],
+            Some(TargetRef::Object(own_forest)),
+        );
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score = AntiSelfHarmPolicy.score(&ctx);
+
+        assert!(
+            score <= -land_value,
+            "a land's mana value is 0 (CR 202.3), so destroying our own land must still \
+             cost at least its card value ({land_value}), got {score}"
+        );
+    }
+
+    #[test]
+    fn strength_of_tajuru_real_parse_prefers_own_creature() {
+        // Three-way trace on the real parse. The chain is
+        // `TargetOnly{Creature}` -> `TargetOnly{Creature, Another}` ->
+        // `PutCounter{+1/+1, X, ParentTarget}`. Against a battlefield creature only
+        // the two `TargetOnly` markers match (the payoff is keyed to
+        // `ParentTarget`), and both are Contextual, so `targeted_object_impact` is
+        // `Some(0.0)` — inside the preference band and therefore NOT a signal.
+        // Layer 2, the spell-level aggregate, is +1.0 from the `PutCounter` and
+        // settles it as Beneficial. Reading `Some(0.0)` as "harmful" is what made
+        // the AI hand the counters to an opponent.
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let abilities = parsed_abilities(
+            "Strength of the Tajuru",
+            TAJURU_ORACLE,
+            &["Multikicker"],
+            &["Sorcery"],
+        );
+        let chain = abilities
+            .iter()
+            .find(|ability| matches!(*ability.effect, Effect::TargetOnly { .. }))
+            .expect("Strength of the Tajuru must parse a TargetOnly marker chain");
+        assert!(
+            ability_tree_any(chain, |effect| matches!(
+                effect,
+                Effect::PutCounter {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            )),
+            "the payoff leaf must still be a ParentTarget-keyed PutCounter: {chain:?}"
+        );
+
+        let legal = vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)];
+        let own = target_verdict_for_definition(
+            &mut state,
+            "Strength of the Tajuru",
+            chain,
+            legal.clone(),
+            TargetRef::Object(own_id),
+        );
+        let opponent = target_verdict_for_definition(
+            &mut state,
+            "Strength of the Tajuru",
+            chain,
+            legal,
+            TargetRef::Object(opp_id),
+        );
+
+        let own_score = score_delta(&own);
+        let opponent_score = score_delta(&opponent);
+        assert!(
+            own_score > opponent_score,
+            "X +1/+1 counters must go on our own creature: own={own_score}, \
+             opponent={opponent_score}"
+        );
+    }
+
+    #[test]
+    fn requisition_raid_counter_player_slot_prefers_self() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let abilities = parsed_abilities(
+            "Requisition Raid",
+            REQUISITION_RAID_ORACLE,
+            &["Spree"],
+            &["Sorcery"],
+        );
+        assert_eq!(
+            abilities.len(),
+            3,
+            "Requisition Raid must parse three Spree modes: {abilities:?}"
+        );
+        assert!(
+            matches!(
+                &*abilities[2].effect,
+                Effect::PutCounterAll {
+                    target: TargetFilter::Typed(typed),
+                    ..
+                } if typed.controller == Some(ControllerRef::TargetPlayer)
+            ),
+            "the counter mode must still be scoped to the chosen player's creatures: {:?}",
+            abilities[2].effect
+        );
+
+        // All three Spree modes chosen. The engine linearises selected modes into a
+        // single sub-ability chain, so both Destroy modes sit in `ctx.effects()`
+        // beside the counter mode and drag the spell-level aggregate negative. Only
+        // the per-player impact of the `TargetPlayer`-scoped counter mode can tell
+        // the AI that the PLAYER slot is the beneficial one.
+        let mut chain = abilities[1].clone();
+        chain.sub_ability = Some(Box::new(abilities[2].clone()));
+        let mut all_modes = abilities[0].clone();
+        all_modes.sub_ability = Some(Box::new(chain));
+
+        let legal = vec![
+            TargetRef::Player(PlayerId(0)),
+            TargetRef::Player(PlayerId(1)),
+        ];
+        let self_verdict = target_verdict_for_definition(
+            &mut state,
+            "Requisition Raid",
+            &all_modes,
+            legal.clone(),
+            TargetRef::Player(PlayerId(0)),
+        );
+        let opponent_verdict = target_verdict_for_definition(
+            &mut state,
+            "Requisition Raid",
+            &all_modes,
+            legal,
+            TargetRef::Player(PlayerId(1)),
+        );
+
+        assert_eq!(
+            reject_kind(&self_verdict),
+            None,
+            "putting the +1/+1 counters on our own creatures must be allowed, got {self_verdict:?}"
+        );
+        assert_eq!(
+            reject_kind(&opponent_verdict),
+            Some("anti_self_harm_wrong_player_target"),
+            "handing an opponent a +1/+1 counter on each of their creatures must be vetoed, \
+             got {opponent_verdict:?}"
+        );
+    }
+
+    #[test]
     fn mutate_target_prefers_own_creature() {
         let mut state = make_state();
         let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
@@ -1357,7 +2890,7 @@ mod tests {
         let context = crate::context::AiContext::empty(&config.weights);
 
         let (decision, candidate) = make_mutate_target_selection_ctx(
-            &state,
+            &mut state,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(own_id)),
         );
@@ -1369,11 +2902,12 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_own = AntiSelfHarmPolicy.score(&ctx_own);
 
         let (decision, candidate) = make_mutate_target_selection_ctx(
-            &state,
+            &mut state,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(opp_id)),
         );
@@ -1385,6 +2919,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -1408,7 +2943,7 @@ mod tests {
         };
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(own_id)),
@@ -1421,11 +2956,12 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_own = AntiSelfHarmPolicy.score(&ctx_own);
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(opp_id)),
@@ -1438,6 +2974,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -1460,7 +2997,7 @@ mod tests {
         };
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(own_id)),
@@ -1473,11 +3010,12 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_own = AntiSelfHarmPolicy.score(&ctx_own);
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(opp_id)),
@@ -1490,6 +3028,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -1501,7 +3040,7 @@ mod tests {
 
     #[test]
     fn beneficial_player_target_prefers_self() {
-        let state = make_state();
+        let mut state = make_state();
         let config = AiConfig::default();
 
         let effect = Effect::Pump {
@@ -1511,7 +3050,7 @@ mod tests {
         };
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![
                 TargetRef::Player(PlayerId(0)),
@@ -1527,11 +3066,12 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_self = AntiSelfHarmPolicy.score(&ctx_self);
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![
                 TargetRef::Player(PlayerId(0)),
@@ -1547,6 +3087,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -1595,6 +3136,9 @@ mod tests {
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets: legal_targets.clone(),
                     optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
                 }],
                 mode_labels: Vec::new(),
                 selection: Default::default(),
@@ -1605,10 +3149,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Player(PlayerId(0))),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let self_ctx = PolicyContext {
             state: &state,
@@ -1618,15 +3159,13 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let opp_candidate = CandidateAction {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Player(PlayerId(1))),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let opp_ctx = PolicyContext {
             state: &state,
@@ -1636,6 +3175,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let self_score = AntiSelfHarmPolicy.score(&self_ctx);
@@ -1644,6 +3184,100 @@ mod tests {
             self_score > opp_score,
             "Net card-positive discard/draw should prefer self: self={self_score}, opp={opp_score}"
         );
+    }
+
+    #[test]
+    fn draw_then_parent_target_discard_prefers_opponent() {
+        let state = make_state();
+        let config = AiConfig::default();
+        let discard = ResolvedAbility::new(
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::ParentTarget,
+                selection: CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: None,
+            },
+            Vec::new(),
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Player,
+            },
+            Vec::new(),
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(discard);
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::TargetSelection {
+                player: PlayerId(0),
+                pending_cast: Box::new(PendingCast::new(
+                    ObjectId(100),
+                    CardId(100),
+                    ability,
+                    ManaCost::zero(),
+                )),
+                target_slots: vec![TargetSelectionSlot {
+                    legal_targets: vec![
+                        TargetRef::Player(PlayerId(0)),
+                        TargetRef::Player(PlayerId(1)),
+                    ],
+                    optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                }],
+                mode_labels: Vec::new(),
+                selection: Default::default(),
+            },
+            candidates: Vec::new(),
+        };
+        let self_candidate = CandidateAction {
+            action: GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(PlayerId(0))),
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
+        };
+        let self_ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &self_candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let opponent_candidate = CandidateAction {
+            action: GameAction::ChooseTarget {
+                target: Some(TargetRef::Player(PlayerId(1))),
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
+        };
+        let opponent_ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &opponent_candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+
+        assert!(matches!(
+            AntiSelfHarmPolicy.verdict(&self_ctx),
+            PolicyVerdict::Reject { ref reason }
+                if reason.kind == "anti_self_harm_wrong_player_target"
+        ));
+        assert!(matches!(
+            AntiSelfHarmPolicy.verdict(&opponent_ctx),
+            PolicyVerdict::Score { .. }
+        ));
     }
 
     #[test]
@@ -1684,6 +3318,9 @@ mod tests {
                         TargetRef::Player(PlayerId(1)),
                     ],
                     optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
                 }],
                 mode_labels: Vec::new(),
                 selection: Default::default(),
@@ -1694,10 +3331,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Player(PlayerId(0))),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let self_ctx = PolicyContext {
             state: &state,
@@ -1707,15 +3341,13 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let opp_candidate = CandidateAction {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Player(PlayerId(1))),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let opp_ctx = PolicyContext {
             state: &state,
@@ -1725,6 +3357,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let self_score = AntiSelfHarmPolicy.score(&self_ctx);
@@ -1837,6 +3470,7 @@ mod tests {
             static_abilities: Vec::new(),
             target: None,
             duration: None,
+            end_cost: None,
         };
         assert_eq!(effect_polarity(&effect), EffectPolarity::Contextual);
     }
@@ -1897,10 +3531,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -1910,6 +3541,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -1959,10 +3591,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -1972,6 +3601,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2057,10 +3687,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2070,6 +3697,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2120,10 +3748,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2133,6 +3758,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2182,10 +3808,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2195,6 +3818,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2244,10 +3868,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2257,6 +3878,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2308,10 +3930,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2321,6 +3940,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2371,10 +3991,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2384,6 +4001,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2415,6 +4033,7 @@ mod tests {
                 amount: engine::types::ability::QuantityExpr::Fixed { value: 3 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         )]);
 
@@ -2433,10 +4052,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2446,6 +4062,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2498,8 +4115,8 @@ mod tests {
         let aura_id = add_aura(&mut state, PlayerId(0), "Rancor");
         let config = AiConfig::default();
 
-        let score_own = score_aura_target(&state, &config, aura_id, own_id, opp_id, own_id);
-        let score_opp = score_aura_target(&state, &config, aura_id, own_id, opp_id, opp_id);
+        let score_own = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, own_id);
+        let score_opp = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, opp_id);
 
         assert!(
             score_own > score_opp,
@@ -2507,9 +4124,31 @@ mod tests {
         );
         assert!(score_own > 0.0, "Own creature score should be positive");
         assert!(
-            score_opp < 0.0,
-            "Opponent creature score should be negative"
+            score_opp <= 0.0,
+            "Opponent creature score should not be positive"
         );
+
+        let (decision, candidate) = make_aura_target_selection_ctx(
+            &mut state,
+            aura_id,
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(opp_id)),
+        );
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        assert!(matches!(
+            AntiSelfHarmPolicy.verdict(&ctx),
+            PolicyVerdict::Reject { reason }
+                if reason.kind == "anti_self_harm_beneficial_aura_opponent_target"
+        ));
     }
 
     #[test]
@@ -2573,6 +4212,9 @@ mod tests {
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets: vec![TargetRef::Object(target_id)],
                     optional: true,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
                 }],
                 mode_labels: Vec::new(),
                 selection: Default::default(),
@@ -2583,10 +4225,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(target_id)),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let ctx = PolicyContext {
             state,
@@ -2596,12 +4235,13 @@ mod tests {
             config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         AntiSelfHarmPolicy.score(&ctx)
     }
 
     fn score_aura_target(
-        state: &GameState,
+        state: &mut GameState,
         config: &AiConfig,
         aura_id: ObjectId,
         own_id: ObjectId,
@@ -2622,6 +4262,7 @@ mod tests {
             config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         AntiSelfHarmPolicy.score(&ctx)
     }
@@ -2649,10 +4290,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2662,6 +4300,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2727,8 +4366,8 @@ mod tests {
         let aura_id = add_harmful_aura(&mut state, PlayerId(0), "Pacifism");
         let config = AiConfig::default();
 
-        let score_own = score_aura_target(&state, &config, aura_id, own_id, opp_id, own_id);
-        let score_opp = score_aura_target(&state, &config, aura_id, own_id, opp_id, opp_id);
+        let score_own = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, own_id);
+        let score_opp = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, opp_id);
 
         assert!(
             score_opp > score_own,
@@ -2746,8 +4385,8 @@ mod tests {
         let aura_id = add_unblockable_aura(&mut state, PlayerId(0), "Aqueous Form");
         let config = AiConfig::default();
 
-        let score_own = score_aura_target(&state, &config, aura_id, own_id, opp_id, own_id);
-        let score_opp = score_aura_target(&state, &config, aura_id, own_id, opp_id, opp_id);
+        let score_own = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, own_id);
+        let score_opp = score_aura_target(&mut state, &config, aura_id, own_id, opp_id, opp_id);
 
         assert!(
             score_own > score_opp,
@@ -2779,10 +4418,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2792,6 +4428,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -2819,7 +4456,7 @@ mod tests {
 
     /// Helper to create a target selection context for an aura (no active effects).
     fn make_aura_target_selection_ctx(
-        state: &GameState,
+        state: &mut GameState,
         aura_id: ObjectId,
         legal_targets: Vec<TargetRef>,
         candidate_target: Option<TargetRef>,
@@ -2831,36 +4468,21 @@ mod tests {
                 static_abilities: Vec::new(),
                 target: None,
                 duration: None,
+                end_cost: None,
             },
             Vec::new(),
             aura_id,
             PlayerId(0),
         );
         let card_id = state.objects[&aura_id].card_id;
-        let pending_cast = PendingCast::new(aura_id, card_id, ability, ManaCost::zero());
-        let decision = AiDecisionContext {
-            waiting_for: WaitingFor::TargetSelection {
-                player: PlayerId(0),
-                pending_cast: Box::new(pending_cast),
-                target_slots: vec![TargetSelectionSlot {
-                    legal_targets,
-                    optional: false,
-                }],
-                mode_labels: Vec::new(),
-                selection: Default::default(),
-            },
-            candidates: Vec::new(),
-        };
-        let candidate = CandidateAction {
-            action: GameAction::ChooseTarget {
-                target: candidate_target,
-            },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
-        };
-        (decision, candidate)
+        install_target_selection_ctx(
+            state,
+            ability,
+            aura_id,
+            card_id,
+            legal_targets,
+            candidate_target,
+        )
     }
 
     /// Fix 1: Pumping during opponent's combat when the only way to pay is by tapping
@@ -2937,10 +4559,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -2950,12 +4569,165 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
         assert!(
             score < -4.0,
             "Should penalize pump spell that must tap creature blocker, got {score}"
+        );
+    }
+
+    /// Row 15 — the F-1 migration, driven through the production policy seam.
+    ///
+    /// CR 701.21: a **Gold** token's mana ability sacrifices its own source, so it
+    /// is NOT a renewable tier-1 rock and cannot spare a creature dork from being
+    /// tapped. The local `ability_cost_requires_sacrifice` this replaced matched
+    /// only a `Composite` cost, while Gold's cost is a **bare** `Sacrifice` — so
+    /// Gold fell to the `_ => false` arm and was counted as tier-1, defeating the
+    /// filter's own stated intent.
+    ///
+    /// Discrimination: with one dork, no lands, and a 1-mana pump, `shortfall`
+    /// is `1`. Counting Gold gives `creatures_at_risk = 1 - 1 = 0` and the
+    /// penalty never fires; excluding it gives `1 - 0 = 1` and the penalty does
+    /// fire. The `score < -4.0` assertion therefore flips exactly on this
+    /// migration.
+    ///
+    /// The paired positive (a Signet-shaped rock, bare `{T}`) proves the
+    /// discriminator is the self-sacrifice clause and not merely the presence of
+    /// a nonland artifact.
+    #[test]
+    fn gold_token_is_not_a_tier1_rock_but_a_signet_is() {
+        use engine::game::effects::token::predefined_token_abilities;
+        use engine::types::ability::{AbilityCost, AbilityKind, ManaContribution, ManaProduction};
+        use engine::types::mana::ManaColor;
+
+        /// Builds the shared fixture: opponent's combat, one non-sick creature
+        /// mana dork, no lands, a `{G}` pump in hand, plus `extra_abilities` on a
+        /// single untapped nonland artifact.
+        fn score_with_artifact(
+            extra_abilities: Vec<engine::types::ability::AbilityDefinition>,
+        ) -> f64 {
+            let mut state = make_state();
+            state.active_player = PlayerId(1);
+            state.phase = Phase::DeclareAttackers;
+
+            let dork_id = add_creature(&mut state, PlayerId(0), "Llanowar Elves", 1, 1);
+            let dork_obj = state.objects.get_mut(&dork_id).unwrap();
+            dork_obj.entered_battlefield_turn = Some(0);
+            let mut mana_ability = engine::types::ability::AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::Fixed {
+                        colors: vec![ManaColor::Green],
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            );
+            mana_ability.cost = Some(AbilityCost::Tap);
+            Arc::make_mut(&mut dork_obj.abilities).push(mana_ability);
+
+            let artifact_id = create_object(
+                &mut state,
+                CardId(600),
+                PlayerId(0),
+                "Artifact".to_string(),
+                Zone::Battlefield,
+            );
+            let artifact = state.objects.get_mut(&artifact_id).unwrap();
+            artifact.card_types.core_types.push(CoreType::Artifact);
+            Arc::make_mut(&mut artifact.abilities).extend(extra_abilities);
+
+            add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+
+            let spell_id = create_object(
+                &mut state,
+                CardId(500),
+                PlayerId(0),
+                "Giant Growth".to_string(),
+                Zone::Hand,
+            );
+            let spell_obj = state.objects.get_mut(&spell_id).unwrap();
+            spell_obj.card_types.core_types.push(CoreType::Instant);
+            spell_obj.mana_cost = ManaCost::Cost {
+                shards: vec![engine::types::mana::ManaCostShard::Green],
+                generic: 0,
+            };
+            spell_obj.abilities = Arc::new(vec![engine::types::ability::AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Pump {
+                    power: PtValue::Fixed(3),
+                    toughness: PtValue::Fixed(3),
+                    target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                },
+            )]);
+
+            let config = AiConfig::default();
+            let decision = AiDecisionContext {
+                waiting_for: WaitingFor::Priority {
+                    player: PlayerId(0),
+                },
+                candidates: Vec::new(),
+            };
+            let candidate = CandidateAction {
+                action: GameAction::CastSpell {
+                    object_id: spell_id,
+                    card_id: CardId(500),
+                    targets: Vec::new(),
+                    payment_mode: CastPaymentMode::Auto,
+                },
+                metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+            };
+            let ctx = PolicyContext {
+                state: &state,
+                decision: &decision,
+                candidate: &candidate,
+                ai_player: PlayerId(0),
+                config: &config,
+                context: &crate::context::AiContext::empty(&config.weights),
+                cast_facts: None,
+                search_depth: crate::policies::context::SearchDepth::Root,
+            };
+            AntiSelfHarmPolicy.score(&ctx)
+        }
+
+        // Verbatim production Gold ability — a BARE `Sacrifice(SelfRef)`.
+        let gold = predefined_token_abilities("Gold");
+        assert_eq!(gold.len(), 1);
+        assert!(
+            matches!(gold[0].cost, Some(AbilityCost::Sacrifice(_))),
+            "reach-guard: Gold's cost must be a BARE Sacrifice, not a Composite — \
+             if this ever changes, this row stops discriminating"
+        );
+
+        // A Signet-shaped renewable rock: bare `{T}`, no sacrifice.
+        let mut signet = engine::types::ability::AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::Fixed {
+                    colors: vec![ManaColor::Green],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            },
+        );
+        signet.cost = Some(AbilityCost::Tap);
+
+        assert!(
+            score_with_artifact(gold) < -4.0,
+            "Gold self-sacrifices, so it cannot spare the dork — the penalty must fire"
+        );
+        assert!(
+            score_with_artifact(vec![signet]) > -4.0,
+            "a renewable Signet-shaped rock IS tier-1 and does spare the dork"
         );
     }
 
@@ -3040,10 +4812,7 @@ mod tests {
 
                 payment_mode: CastPaymentMode::Auto,
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Spell,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -3053,6 +4822,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -3092,7 +4862,7 @@ mod tests {
             target: TargetFilter::Any,
         };
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(attacker_id)],
             Some(TargetRef::Object(attacker_id)),
@@ -3105,6 +4875,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let score = AntiSelfHarmPolicy.score(&ctx);
@@ -3144,11 +4915,11 @@ mod tests {
         token_obj.is_token = true;
 
         // Set up pending trigger with exile effect (like Seam Rip)
-        state.pending_trigger = Some(engine::game::triggers::PendingTrigger {
+        state.pending_trigger = Some(Box::new(engine::game::triggers::PendingTrigger {
             source_id: ObjectId(200),
             controller: PlayerId(0),
             condition: None,
-            ability: ResolvedAbility::new(
+            ability: Box::new(ResolvedAbility::new(
                 Effect::ChangeZone {
                     origin: None,
                     destination: Zone::Exile,
@@ -3167,7 +4938,7 @@ mod tests {
                 Vec::new(),
                 ObjectId(200),
                 PlayerId(0),
-            ),
+            )),
             timestamp: 1,
             target_constraints: Vec::new(),
             distribute: None,
@@ -3178,7 +4949,8 @@ mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
-        });
+            provenance: None,
+        }));
 
         let config = AiConfig::default();
         let legal_targets = vec![TargetRef::Object(creature), TargetRef::Object(token)];
@@ -3191,6 +4963,9 @@ mod tests {
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets: legal_targets.clone(),
                     optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
                 }],
                 mode_labels: Vec::new(),
                 target_constraints: Vec::new(),
@@ -3206,10 +4981,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(creature)),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let creature_ctx = PolicyContext {
             state: &state,
@@ -3219,6 +4991,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let creature_score = AntiSelfHarmPolicy.score(&creature_ctx);
 
@@ -3227,10 +5000,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(token)),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let token_ctx = PolicyContext {
             state: &state,
@@ -3240,6 +5010,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let token_score = AntiSelfHarmPolicy.score(&token_ctx);
 
@@ -3256,13 +5027,55 @@ mod tests {
     }
 
     #[test]
-    fn trigger_target_effects_are_extracted() {
+    fn noncreature_ward_target_scores_lower_than_unwarded_equivalent() {
         let mut state = make_state();
-        state.pending_trigger = Some(engine::game::triggers::PendingTrigger {
+
+        // Two identical artifacts (non-creature): one bare, one with a small, payable,
+        // nonlethal poison-counter Ward. Both owned by the opponent (PlayerId(1)) so removal
+        // targeting them is non-beneficial from the AI's (PlayerId(0)) perspective.
+        let bare_card_id = CardId(state.next_object_id);
+        let bare_artifact = create_object(
+            &mut state,
+            bare_card_id,
+            PlayerId(1),
+            "Prophetic Prism".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&bare_artifact)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(engine::types::card_type::CoreType::Artifact);
+
+        let warded_card_id = CardId(state.next_object_id);
+        let warded_artifact = create_object(
+            &mut state,
+            warded_card_id,
+            PlayerId(1),
+            "Warded Relic".to_string(),
+            Zone::Battlefield,
+        );
+        let warded_obj = state.objects.get_mut(&warded_artifact).unwrap();
+        warded_obj
+            .card_types
+            .core_types
+            .push(engine::types::card_type::CoreType::Artifact);
+        warded_obj
+            .keywords
+            .push(Keyword::Ward(WardCost::GetPlayerCounters {
+                counter_kind: engine::types::player::PlayerCounterKind::Poison,
+                count: 2,
+            }));
+
+        // Set up pending trigger with a removal (exile) effect, matching
+        // `trigger_target_prefers_creature_over_token` above.
+        state.pending_trigger = Some(Box::new(engine::game::triggers::PendingTrigger {
             source_id: ObjectId(200),
             controller: PlayerId(0),
             condition: None,
-            ability: ResolvedAbility::new(
+            ability: Box::new(ResolvedAbility::new(
                 Effect::ChangeZone {
                     origin: None,
                     destination: Zone::Exile,
@@ -3281,7 +5094,7 @@ mod tests {
                 Vec::new(),
                 ObjectId(200),
                 PlayerId(0),
-            ),
+            )),
             timestamp: 1,
             target_constraints: Vec::new(),
             distribute: None,
@@ -3292,7 +5105,119 @@ mod tests {
             may_trigger_origin: None,
             subject_match_count: None,
             die_result: None,
-        });
+            provenance: None,
+        }));
+
+        let config = AiConfig::default();
+        let legal_targets = vec![
+            TargetRef::Object(bare_artifact),
+            TargetRef::Object(warded_artifact),
+        ];
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::TriggerTargetSelection {
+                player: PlayerId(0),
+                trigger_controller: None,
+                trigger_event: None,
+                trigger_events: Vec::new(),
+                target_slots: vec![TargetSelectionSlot {
+                    legal_targets: legal_targets.clone(),
+                    optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
+                }],
+                mode_labels: Vec::new(),
+                target_constraints: Vec::new(),
+                selection: Default::default(),
+                source_id: Some(ObjectId(200)),
+                description: None,
+            },
+            candidates: Vec::new(),
+        };
+
+        // Score targeting the bare artifact
+        let bare_candidate = CandidateAction {
+            action: GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(bare_artifact)),
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
+        };
+        let bare_ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &bare_candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let bare_score = AntiSelfHarmPolicy.score(&bare_ctx);
+
+        // Score targeting the warded artifact
+        let warded_candidate = CandidateAction {
+            action: GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(warded_artifact)),
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
+        };
+        let warded_ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &warded_candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let warded_score = AntiSelfHarmPolicy.score(&warded_ctx);
+
+        assert!(
+            bare_score > warded_score,
+            "Should prefer targeting the unwarded artifact ({bare_score}) over the poison-Ward artifact ({warded_score})"
+        );
+    }
+
+    #[test]
+    fn trigger_target_effects_are_extracted() {
+        let mut state = make_state();
+        state.pending_trigger = Some(Box::new(engine::game::triggers::PendingTrigger {
+            source_id: ObjectId(200),
+            controller: PlayerId(0),
+            condition: None,
+            ability: Box::new(ResolvedAbility::new(
+                Effect::ChangeZone {
+                    origin: None,
+                    destination: Zone::Exile,
+                    target: TargetFilter::Any,
+                    owner_library: false,
+                    enter_transformed: false,
+                    enters_under: None,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+                    enters_attacking: false,
+                    up_to: false,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
+                    face_down_profile: None,
+                    enters_modified_if: None,
+                },
+                Vec::new(),
+                ObjectId(200),
+                PlayerId(0),
+            )),
+            timestamp: 1,
+            target_constraints: Vec::new(),
+            distribute: None,
+            trigger_event: None,
+            modal: None,
+            mode_abilities: vec![],
+            description: None,
+            may_trigger_origin: None,
+            subject_match_count: None,
+            die_result: None,
+            provenance: None,
+        }));
 
         let config = AiConfig::default();
         let decision = AiDecisionContext {
@@ -3312,10 +5237,7 @@ mod tests {
         };
         let candidate = CandidateAction {
             action: GameAction::ChooseTarget { target: None },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let ctx = PolicyContext {
             state: &state,
@@ -3325,6 +5247,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let effects = ctx.effects();
@@ -3358,6 +5281,7 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         };
         let ability = ResolvedAbility::new(effect, Vec::new(), fanatic_id, PlayerId(0));
         let mut pending_cast = PendingCast::new(fanatic_id, CardId(100), ability, ManaCost::zero());
@@ -3380,6 +5304,9 @@ mod tests {
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets,
                     optional: false,
+                    chooser: None,
+                    effect_kind: EffectKind::NoOp,
+                    effect_detail: TargetEffectDetail::None,
                 }],
                 mode_labels: Vec::new(),
                 selection: Default::default(),
@@ -3392,10 +5319,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(fanatic_id)),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let ctx_self = PolicyContext {
             state: &state,
@@ -3405,6 +5329,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let verdict_self = AntiSelfHarmPolicy.verdict(&ctx_self);
 
@@ -3413,10 +5338,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Object(opp_creature)),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let ctx_opp = PolicyContext {
             state: &state,
@@ -3426,6 +5348,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -3434,10 +5357,7 @@ mod tests {
             action: GameAction::ChooseTarget {
                 target: Some(TargetRef::Player(PlayerId(1))),
             },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Target,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Target),
         };
         let ctx_player = PolicyContext {
             state: &state,
@@ -3447,6 +5367,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_player = AntiSelfHarmPolicy.score(&ctx_player);
 
@@ -3480,11 +5401,12 @@ mod tests {
                 .affected(TargetFilter::Typed(TypedFilter::creature()))],
             duration: Some(engine::types::ability::Duration::UntilEndOfTurn),
             target: Some(TargetFilter::Typed(TypedFilter::creature())),
+            end_cost: None,
         };
 
         // Score targeting own creature
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(own_id)),
@@ -3497,12 +5419,13 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_own = AntiSelfHarmPolicy.score(&ctx_own);
 
         // Score targeting opponent's creature
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
             Some(TargetRef::Object(opp_id)),
@@ -3515,6 +5438,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
 
@@ -3550,10 +5474,11 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 2 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         };
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![TargetRef::Object(opp_id), TargetRef::Player(PlayerId(1))],
             Some(TargetRef::Object(opp_id)),
@@ -3566,12 +5491,13 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_creature = AntiSelfHarmPolicy.score(&ctx_creature);
 
         // Compare: burn to opponent's face
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(opp_id), TargetRef::Player(PlayerId(1))],
             Some(TargetRef::Player(PlayerId(1))),
@@ -3584,6 +5510,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score_face = AntiSelfHarmPolicy.score(&ctx_face);
 
@@ -3614,10 +5541,11 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 3 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         };
 
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(opp_id), TargetRef::Player(PlayerId(1))],
             Some(TargetRef::Object(opp_id)),
@@ -3630,6 +5558,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score = AntiSelfHarmPolicy.score(&ctx);
 
@@ -3660,6 +5589,7 @@ mod tests {
                         ],
                     },
                     damage_source: None,
+                    excess: None,
                 },
             ));
         state
@@ -3673,9 +5603,10 @@ mod tests {
             amount: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::Any,
             damage_source: None,
+            excess: None,
         };
         let (decision, candidate) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![TargetRef::Object(spiteful)],
             Some(TargetRef::Object(spiteful)),
@@ -3689,6 +5620,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let score = AntiSelfHarmPolicy.score(&ctx);
         assert!(
@@ -3712,11 +5644,12 @@ mod tests {
             },
             target: TargetFilter::Player,
             damage_source: None,
+            excess: None,
         };
         let config = AiConfig::default();
 
         let (decision, candidate_lowest) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect.clone(),
             vec![
                 TargetRef::Player(PlayerId(1)),
@@ -3732,11 +5665,12 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let lowest_score = AntiSelfHarmPolicy.score(&ctx_lowest);
 
         let (decision, candidate_other) = make_target_selection_ctx(
-            &state,
+            &mut state,
             effect,
             vec![
                 TargetRef::Player(PlayerId(1)),
@@ -3752,6 +5686,7 @@ mod tests {
             config: &config,
             context: &crate::context::AiContext::empty(&config.weights),
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         let other_score = AntiSelfHarmPolicy.score(&ctx_other);
 
@@ -3800,6 +5735,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         AntiSelfHarmPolicy.score(&ctx)
     }
@@ -3816,6 +5752,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         AntiSelfHarmPolicy.verdict(&ctx)
     }
@@ -3826,6 +5763,7 @@ mod tests {
             self_loss.then_some(DelayedTriggerCondition::AtNextPhaseForPlayer {
                 phase: Phase::End,
                 player: PlayerId(0),
+                gate: engine::types::ability::TurnGate::None,
             }),
         )
     }
@@ -3863,6 +5801,53 @@ mod tests {
         let obj = state.objects.get_mut(&id).unwrap();
         obj.card_types.core_types.push(CoreType::Instant);
         obj.abilities = Arc::new(vec![ability]);
+        id
+    }
+
+    /// Mirrors the parser's Pact-cycle lowering: a separate spell ability
+    /// creates a controller-scoped next-upkeep delayed trigger whose mandatory
+    /// payment is followed by the failed-payment loss branch.
+    fn next_upkeep_payment_or_loss_spell(
+        state: &mut GameState,
+        payment: AbilityCost,
+        loss_condition: AbilityCondition,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            "Deferred payment specimen".to_string(),
+            Zone::Hand,
+        );
+        let failure = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::LoseTheGame {
+                target: Some(TargetFilter::Controller),
+            },
+        )
+        .condition(loss_condition);
+        let payment = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PayCost {
+                cost: payment,
+                scale: None,
+                payer: TargetFilter::Controller,
+            },
+        )
+        .sub_ability(failure);
+        let delayed = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase: Phase::Upkeep,
+                    player: PlayerId(0),
+                    gate: engine::types::ability::TurnGate::None,
+                },
+                effect: Box::new(payment),
+                uses_tracked_set: false,
+            },
+        );
+        state.objects.get_mut(&id).unwrap().abilities = Arc::new(vec![delayed]);
         id
     }
 
@@ -3988,12 +5973,108 @@ mod tests {
             Some(DelayedTriggerCondition::AtNextPhaseForPlayer {
                 phase: Phase::Upkeep,
                 player: PlayerId(0),
+                gate: engine::types::ability::TurnGate::None,
             }),
         );
 
         assert!(matches!(
             pre_cast_verdict_for_spell(&state, spell_id),
             PolicyVerdict::Score { .. }
+        ));
+    }
+
+    #[test]
+    fn rejects_cast_creating_next_upkeep_mana_payment_or_loss_obligation() {
+        let mut state = make_state();
+        let spell_id = next_upkeep_payment_or_loss_spell(
+            &mut state,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(4),
+            },
+            AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::effect_performed()),
+            },
+        );
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Reject { reason }
+                if reason.kind == "anti_self_harm_next_upkeep_mana_loss"
+        ));
+    }
+
+    #[test]
+    fn current_summoners_pact_parse_matches_the_structural_obligation() {
+        let parsed = parse_oracle_text(
+            "Search your library for a green creature card, reveal it, put it into your hand, then shuffle.\nAt the beginning of your next upkeep, pay {2}{G}{G}. If you don't, you lose the game.",
+            "Summoner's Pact",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+
+        assert!(
+            parsed.abilities.iter().any(is_pact_payment_ability),
+            "the current Pact Oracle parse must retain its deferred payment-or-loss structure"
+        );
+    }
+
+    #[test]
+    fn ignores_pact_shape_in_an_unchosen_modal_branch() {
+        let mut state = make_state();
+        let spell_id = next_upkeep_payment_or_loss_spell(
+            &mut state,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(4),
+            },
+            AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::effect_performed()),
+            },
+        );
+        let pact_branch = state.objects[&spell_id].abilities[0].clone();
+        let mut unchosen_modal = AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp);
+        unchosen_modal.mode_abilities.push(pact_branch);
+        state.objects.get_mut(&spell_id).unwrap().abilities = Arc::new(vec![unchosen_modal]);
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Score { delta, .. } if delta == 0.0
+        ));
+    }
+
+    #[test]
+    fn leaves_non_mana_deferred_payment_obligation_neutral() {
+        let mut state = make_state();
+        let spell_id = next_upkeep_payment_or_loss_spell(
+            &mut state,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+            },
+            AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::effect_performed()),
+            },
+        );
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Score { delta, .. } if delta == 0.0
+        ));
+    }
+
+    #[test]
+    fn leaves_ambiguous_next_upkeep_mana_loss_neutral() {
+        let mut state = make_state();
+        let spell_id = next_upkeep_payment_or_loss_spell(
+            &mut state,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(4),
+            },
+            AbilityCondition::effect_performed(),
+        );
+
+        assert!(matches!(
+            pre_cast_verdict_for_spell(&state, spell_id),
+            PolicyVerdict::Score { delta, .. } if delta == 0.0
         ));
     }
 
@@ -4138,10 +6219,7 @@ mod tests {
         };
         let candidate = CandidateAction {
             action: GameAction::DecideOptionalEffect { accept: true },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Replacement,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Replacement),
         };
         let context = crate::context::AiContext::empty(&config.weights);
         let ctx = PolicyContext {
@@ -4152,8 +6230,315 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
         AntiSelfHarmPolicy.verdict(&ctx)
+    }
+
+    #[test]
+    fn registry_rejects_the_generated_accepted_optional_life_cost_and_reducer_pays_it() {
+        let (mut state, candidate) = live_additional_cost_candidate(optional_life_cost(), true);
+        let verdicts = shared_registry_verdicts_for(&state, &candidate);
+        assert!(verdicts.into_iter().any(|(id, verdict)| {
+            id == PolicyId::AntiSelfHarm
+                && matches!(
+                    verdict,
+                    PolicyVerdict::Reject { reason }
+                        if reason.kind == "anti_self_harm_lethal_life_commitment"
+                            && reason.facts == [("before", 2), ("after", 0), ("committed", 2)]
+                )
+        }));
+
+        engine::game::apply_as_current(&mut state, candidate.action)
+            .expect("the exact generated accept action must remain reducer-legal");
+        assert_eq!(state.players[0].life, 0);
+    }
+
+    #[test]
+    fn registry_rejects_the_generated_queued_repeatable_optional_life_cost() {
+        let (mut state, candidate) = live_queued_repeatable_life_candidate();
+        assert!(shared_registry_verdicts_for(&state, &candidate)
+            .into_iter()
+            .any(|(id, verdict)| {
+                id == PolicyId::AntiSelfHarm
+                    && matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                                && reason.facts
+                                    == [("before", 2), ("after", 0), ("committed", 2)]
+                    )
+            }));
+
+        engine::game::apply_as_current(&mut state, candidate.action)
+            .expect("the exact queued repeatable accept action must remain reducer-legal");
+        assert_eq!(state.players[0].life, 0);
+    }
+
+    #[test]
+    fn registry_binds_generated_defiler_candidates_to_the_live_offer_and_receipt() {
+        let (mut lethal_state, lethal_accept) = live_defiler_candidate(2, true);
+        assert!(shared_registry_verdicts_for(&lethal_state, &lethal_accept)
+            .into_iter()
+            .any(|(id, verdict)| {
+                id == PolicyId::AntiSelfHarm
+                    && matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                                && reason.facts
+                                    == [("before", 2), ("after", 0), ("committed", 2)]
+                    )
+            }));
+        engine::game::apply_as_current(&mut lethal_state, lethal_accept.action)
+            .expect("the exact generated Defiler accept action must remain reducer-legal");
+        assert_eq!(lethal_state.players[0].life, 0);
+
+        let (decline_state, decline) = live_defiler_candidate(2, false);
+        assert!(shared_registry_verdicts_for(&decline_state, &decline)
+            .into_iter()
+            .all(|(id, verdict)| {
+                id != PolicyId::AntiSelfHarm
+                    || !matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                    )
+            }));
+
+        let (nonlethal_state, nonlethal_accept) = live_defiler_candidate(3, true);
+        assert!(
+            shared_registry_verdicts_for(&nonlethal_state, &nonlethal_accept)
+                .into_iter()
+                .all(|(id, verdict)| {
+                    id != PolicyId::AntiSelfHarm
+                        || !matches!(
+                            verdict,
+                            PolicyVerdict::Reject { reason }
+                                if reason.kind == "anti_self_harm_lethal_life_commitment"
+                        )
+                })
+        );
+
+        let (stale_state, mut stale_accept) = live_defiler_candidate(2, true);
+        stale_accept.metadata.tactical_class = TacticalClass::Utility;
+        assert_eq!(
+            preview_candidate_life_safety(&stale_state, &stale_accept),
+            CandidateLifeSafety::NotUnsafe,
+            "a candidate whose full generated provenance no longer matches is neutral"
+        );
+    }
+
+    #[test]
+    fn registry_uses_the_replacement_adjusted_defiler_receipt() {
+        let (mut state, candidate) = live_defiler_candidate(3, true);
+        install_life_loss_replacements(
+            &mut state,
+            vec![ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                .quantity_modification(QuantityModification::DOUBLE)],
+        );
+
+        assert!(shared_registry_verdicts_for(&state, &candidate)
+            .into_iter()
+            .any(|(id, verdict)| {
+                id == PolicyId::AntiSelfHarm
+                    && matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                                && reason.facts
+                                    == [("before", 3), ("after", -1), ("committed", 4)]
+                    )
+            }));
+
+        engine::game::apply_as_current(&mut state, candidate.action)
+            .expect("the replacement-adjusted generated Defiler action must remain reducer-legal");
+        assert_eq!(state.players[0].life, -1);
+    }
+
+    #[test]
+    fn preview_handles_real_replacement_carriers_without_fabricated_probe_state() {
+        let (mut deferred_state, deferred_candidate) = live_defiler_candidate(3, true);
+        install_life_loss_replacements(
+            &mut deferred_state,
+            vec![
+                ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                    .quantity_modification(QuantityModification::DOUBLE),
+                ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                    .quantity_modification(QuantityModification::Plus { value: 1 }),
+            ],
+        );
+        assert_eq!(
+            preview_candidate_life_safety(&deferred_state, &deferred_candidate),
+            CandidateLifeSafety::NotUnsafe,
+            "a real replacement-ordering continuation with no life edit is neutral"
+        );
+        engine::game::apply_as_current(&mut deferred_state, deferred_candidate.action)
+            .expect("the generated Defiler decision must reach its real replacement continuation");
+        assert_eq!(deferred_state.players[0].life, 3);
+        assert!(matches!(
+            deferred_state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+
+        let (mut receipt_state, receipt_candidate) = live_defiler_candidate_with_mana_cost(
+            2,
+            true,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+                generic: 0,
+            },
+        );
+        install_life_loss_replacements(
+            &mut receipt_state,
+            vec![post_mutation_life_loss_modifier()],
+        );
+        assert_eq!(
+            preview_candidate_life_safety(&receipt_state, &receipt_candidate),
+            CandidateLifeSafety::Unsafe {
+                before: 2,
+                after: 0,
+                committed: 2,
+            },
+            "a real post-edit mana-payment continuation retains its bound receipt"
+        );
+        engine::game::apply_as_current(&mut receipt_state, receipt_candidate.action)
+            .expect("the generated Defiler decision must remain reducer-legal at lethal life");
+        assert_eq!(receipt_state.players[0].life, 0);
+        assert!(
+            matches!(
+                receipt_state.waiting_for,
+                WaitingFor::GameOver {
+                    winner: Some(PlayerId(1))
+                }
+            ),
+            "public action reconciliation must end the game after a lethal Defiler payment, got {:?}",
+            receipt_state.waiting_for
+        );
+    }
+
+    #[test]
+    fn registry_keeps_optional_life_cost_decline_neutral() {
+        let (mut state, candidate) = live_additional_cost_candidate(optional_life_cost(), false);
+        let verdicts = shared_registry_verdicts_for(&state, &candidate);
+        assert!(verdicts.into_iter().all(|(id, verdict)| {
+            id != PolicyId::AntiSelfHarm
+                || !matches!(
+                    verdict,
+                    PolicyVerdict::Reject { reason }
+                        if reason.kind == "anti_self_harm_lethal_life_commitment"
+                )
+        }));
+
+        engine::game::apply_as_current(&mut state, candidate.action)
+            .expect("the exact generated decline action must remain reducer-legal");
+        assert_eq!(state.players[0].life, 2);
+    }
+
+    #[test]
+    fn registry_binds_choice_cost_to_the_selected_direct_life_branch() {
+        let life = AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+        };
+        let mana = AbilityCost::Mana {
+            cost: ManaCost::zero(),
+        };
+        let (mut accepted_state, accepted) =
+            live_additional_cost_candidate(AdditionalCost::Choice(life, mana), true);
+        assert!(shared_registry_verdicts_for(&accepted_state, &accepted)
+            .into_iter()
+            .any(|(id, verdict)| {
+                id == PolicyId::AntiSelfHarm
+                    && matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                    )
+            }));
+        engine::game::apply_as_current(&mut accepted_state, accepted.action)
+            .expect("the generated preferred-choice action must remain reducer-legal");
+        assert_eq!(accepted_state.players[0].life, 0);
+
+        let (mut fallback_state, fallback) = live_additional_cost_candidate(
+            AdditionalCost::Choice(
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                },
+                AbilityCost::Mana {
+                    cost: ManaCost::zero(),
+                },
+            ),
+            false,
+        );
+        assert!(shared_registry_verdicts_for(&fallback_state, &fallback)
+            .into_iter()
+            .all(|(id, verdict)| {
+                id != PolicyId::AntiSelfHarm
+                    || !matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                    )
+            }));
+        engine::game::apply_as_current(&mut fallback_state, fallback.action)
+            .expect("the generated fallback-choice action must remain reducer-legal");
+        assert_eq!(fallback_state.players[0].life, 2);
+    }
+
+    #[test]
+    fn real_combat_tax_phyrexian_life_continuation_never_routes_through_cast_cost_veto() {
+        let mut state = make_state();
+        state.phase = Phase::DeclareAttackers;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.players[0].life = 2;
+        let attacker = add_creature(&mut state, PlayerId(0), "Taxed attacker", 2, 2);
+        install_norns_annex_style_tax(&mut state);
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: PlayerId(0),
+            valid_attacker_ids: vec![attacker],
+            valid_attack_targets: vec![AttackTarget::Player(PlayerId(1))],
+            valid_attack_targets_by_attacker: None,
+            attacker_constraints: Default::default(),
+        };
+
+        engine::game::apply_as_current(
+            &mut state,
+            GameAction::DeclareAttackers {
+                attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            },
+        )
+        .expect("the real taxed attack must enter CombatTaxPayment");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::CombatTaxPayment { .. }
+        ));
+
+        let candidate = engine::ai_support::candidate_actions(&state)
+            .into_iter()
+            .find(|candidate| matches!(candidate.action, GameAction::PayCombatTax { accept: true }))
+            .expect("combat tax accept must be generated from its real waiting state");
+        assert_eq!(
+            preview_candidate_life_safety(&state, &candidate),
+            CandidateLifeSafety::NotUnsafe
+        );
+        assert!(shared_registry_verdicts_for(&state, &candidate)
+            .into_iter()
+            .all(|(id, verdict)| {
+                id != PolicyId::AntiSelfHarm
+                    || !matches!(
+                        verdict,
+                        PolicyVerdict::Reject { reason }
+                            if reason.kind == "anti_self_harm_lethal_life_commitment"
+                    )
+            }));
+        engine::game::apply_as_current(&mut state, candidate.action)
+            .expect("the generated combat-tax acceptance must reach its real payment continuation");
+        assert_eq!(
+            state.players[0].life, 0,
+            "the Norn's-Annex-style tax reaches its Phyrexian life-payment continuation"
+        );
     }
 
     /// `OptionalEffectChoice` routes through `DecisionKind::ActivateAbility`, so
@@ -4173,6 +6558,7 @@ mod tests {
             source_id,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
 
         let config = AiConfig::default();
@@ -4182,10 +6568,7 @@ mod tests {
         };
         let candidate = CandidateAction {
             action: GameAction::DecideOptionalEffect { accept: true },
-            metadata: ActionMetadata {
-                actor: Some(PlayerId(0)),
-                tactical_class: TacticalClass::Replacement,
-            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Replacement),
         };
         let context = crate::context::AiContext::empty(&config.weights);
         let ctx = PolicyContext {
@@ -4196,6 +6579,7 @@ mod tests {
             config: &config,
             context: &context,
             cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
         };
 
         let verdicts = crate::policies::registry::PolicyRegistry::shared().verdicts(&ctx);
@@ -4231,6 +6615,7 @@ mod tests {
             source_id,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         assert!(matches!(
             optional_effect_accept_verdict(&state),
@@ -4253,6 +6638,7 @@ mod tests {
             source_id,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         assert!(matches!(
             optional_effect_accept_verdict(&state),
@@ -4275,6 +6661,7 @@ mod tests {
             source_id,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         assert!(matches!(
             optional_effect_accept_verdict(&state),
@@ -4308,11 +6695,433 @@ mod tests {
             source_id,
             description: None,
             may_trigger_key: None,
+            same_card_may_trigger_choice_available: false,
         };
         assert!(matches!(
             optional_effect_accept_verdict(&state),
             PolicyVerdict::Reject { reason }
                 if reason.kind == "anti_self_harm_lethal_life_cost"
         ));
+    }
+
+    // Verbatim production shape of the Slash-of-Light gap: a targeted
+    // creature-only DealDamage whose amount is dynamic (ObjectCount-based, not
+    // a literal constant). `lethal_to_creature` returns `None` for a non-Fixed
+    // amount, so `is_useful_removal_target` fails open as "useful" and the
+    // sibling no-targetable-opponent-creature branch never fires. The
+    // `removal_lethality::can_kill_any_legal_target` gate must penalise
+    // committing this when 1 damage is non-lethal to every legal opponent
+    // creature.
+    #[test]
+    fn pre_cast_penalises_dynamic_damage_whiff_that_kills_no_opponent_creature() {
+        let mut state = make_state();
+        // AI's single creature makes "number of creatures you control" resolve
+        // to 1.
+        add_creature(&mut state, PlayerId(0), "My Bear", 2, 1);
+        // Opponent's 3/3 that 1 damage cannot kill (CR 704.5g).
+        add_creature(&mut state, PlayerId(1), "Opponent Bear", 3, 3);
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_000),
+            PlayerId(0),
+            "Slash of Light".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&spell_id).unwrap();
+        let mut my_filter = TypedFilter::creature();
+        my_filter.controller = Some(ControllerRef::You);
+        let amount = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(my_filter),
+            },
+        };
+        obj.abilities = Arc::new(vec![AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::DealDamage {
+                amount,
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                damage_source: None,
+                excess: None,
+            },
+        )]);
+
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: spell_id,
+                card_id: CardId(90_000),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score = AntiSelfHarmPolicy.score(&ctx);
+        assert!(
+            score < -5.0,
+            "Casting a dynamic burn whose 1 damage kills no opponent creature \
+             should be penalised, got {score}"
+        );
+    }
+
+    /// Cast-commit seam regression: a MIXED spell coupling a creature-only
+    /// damage half with a `DestroyAll` wipe (CR 701.8) must NOT be charged the
+    /// -8 no-target penalty when its ONLY opposing creature is HEXPROOF.
+    /// Hexproof (`Keyword::Hexproof`) gates TARGETING only (CR 702.11b) — an
+    /// affected object is not a target — while the wipe is NON-targeted and
+    /// hits the battlefield POPULATION regardless (CR 115.10a). So
+    /// `has_targetable_opponent_creature` is false here, but
+    /// `removal_lethality::has_opposing_mass_population` is true, and
+    /// `score_pre_cast` must consult the mass seam before charging the
+    /// no-target penalty. Pre-fix, the ordering charged the -8 penalty — a
+    /// false positive for a spell whose wipe genuinely clears the hexproof
+    /// 3/3. The AI's OWN bear exists solely so the damage half is announceable
+    /// (CR 601.2c); this test pins the PENALTY question, not castability.
+    #[test]
+    fn pre_cast_does_not_penalise_mixed_wipe_when_only_population_is_hexproof() {
+        let mut state = make_state();
+        // AI's own creature makes the dynamic ObjectCount amount resolve to 1.
+        add_creature(&mut state, PlayerId(0), "My Bear", 2, 1);
+        // The ONLY opposing creature is hexproof (un-targetable, CR 702.11b)
+        // but is in the wipe's NON-targeted population (CR 115.10a).
+        let hexproof_bear = add_creature(&mut state, PlayerId(1), "Hexproof Bear", 3, 3);
+        state
+            .objects
+            .get_mut(&hexproof_bear)
+            .unwrap()
+            .keywords
+            .push(Keyword::Hexproof);
+
+        let spell_id = create_object(
+            &mut state,
+            CardId(90_001),
+            PlayerId(0),
+            "Hexproof-Proof Judgement".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&spell_id).unwrap();
+        let mut my_filter = TypedFilter::creature();
+        my_filter.controller = Some(ControllerRef::You);
+        let amount = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(my_filter),
+            },
+        };
+        obj.abilities = Arc::new(vec![
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::DealDamage {
+                    amount,
+                    target: TargetFilter::Typed(TypedFilter::creature()),
+                    damage_source: None,
+                    excess: None,
+                },
+            ),
+            // `None` is the serde default for `DestroyAll.target`; construct it
+            // explicitly so the resolver's `None` -> all-creatures population
+            // (destroy.rs `resolve_all`) is the point under test.
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::DestroyAll {
+                    target: TargetFilter::None,
+                    cant_regenerate: false,
+                },
+            ),
+        ]);
+
+        let config = AiConfig::default();
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::Priority {
+                player: PlayerId(0),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::CastSpell {
+                object_id: spell_id,
+                card_id: CardId(90_001),
+                targets: Vec::new(),
+                payment_mode: CastPaymentMode::Auto,
+            },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Spell),
+        };
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &crate::context::AiContext::empty(&config.weights),
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let score = AntiSelfHarmPolicy.score(&ctx);
+        assert!(
+            score > -5.0,
+            "A mixed deal-1 + destroy-all vs a hexproof-only opposing board \
+             ({score:.3}) must NOT be charged the no-target penalty: the wipe is \
+             NON-targeted (CR 115.10a) and hits the hexproof 3/3's population \
+             (hexproof gates targeting only, CR 702.11b), so the mass seam \
+             rescues the mixed spell from the wasted-cast penalty"
+        );
+    }
+    const WITHERBLOOM_CHARM_ORACLE: &str = "Choose one —\n\
+         • You may sacrifice a permanent. If you do, draw two cards.\n\
+         • You gain 5 life.\n\
+         • Destroy target nonland permanent with mana value 2 or less.";
+
+    /// A battlefield artifact with a real mana value, so `Cmc` filter
+    /// properties resolve against it.
+    fn add_mana_rock(state: &mut GameState, owner: PlayerId, name: &str, generic: u32) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            owner,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&id).unwrap();
+        object.card_types.core_types.push(CoreType::Artifact);
+        object.mana_cost = ManaCost::Cost {
+            shards: Vec::new(),
+            generic,
+        };
+        id
+    }
+
+    /// Put the real parse of `oracle` on the stack as an AI-controlled modal
+    /// spell and score the `SelectModes { indices }` candidate. Mirrors
+    /// production: `ModeChoice` carries the `PendingCast`, and the modes are the
+    /// object's spell-kind abilities (`modal_spell_mode_ability_refs`).
+    fn select_modes_score(
+        state: &mut GameState,
+        card_name: &str,
+        modes: &[AbilityDefinition],
+        indices: Vec<usize>,
+    ) -> f64 {
+        let source_id = create_object(
+            state,
+            CardId(state.next_object_id),
+            PlayerId(0),
+            card_name.to_string(),
+            Zone::Stack,
+        );
+        let card_id = state.objects[&source_id].card_id;
+        let object = state.objects.get_mut(&source_id).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        *Arc::make_mut(&mut object.abilities) = modes.to_vec();
+
+        let resolved = build_resolved_from_def(&modes[0], source_id, PlayerId(0));
+        let pending_cast = PendingCast::new(source_id, card_id, resolved, ManaCost::zero());
+        state.waiting_for = WaitingFor::ModeChoice {
+            player: PlayerId(0),
+            modal: ModalChoice {
+                min_choices: 1,
+                max_choices: 1,
+                mode_count: modes.len(),
+                ..ModalChoice::default()
+            },
+            pending_cast: Box::new(pending_cast),
+            unavailable_modes: Vec::new(),
+        };
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::SelectModes { indices },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
+        };
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        AntiSelfHarmPolicy.score(&ctx)
+    }
+
+    fn witherbloom_charm_modes() -> Vec<AbilityDefinition> {
+        let modes = parsed_abilities(
+            "Witherbloom Charm",
+            WITHERBLOOM_CHARM_ORACLE,
+            &[],
+            &["Instant"],
+        );
+        assert_eq!(modes.len(), 3, "three printed modes: {modes:?}");
+        assert!(
+            matches!(*modes[1].effect, Effect::GainLife { .. }),
+            "mode 2 must still parse as the beneficial GainLife comparator: {:?}",
+            modes[1].effect
+        );
+        assert!(
+            matches!(*modes[2].effect, Effect::Destroy { .. }),
+            "mode 3 must still parse as a Destroy: {:?}",
+            modes[2].effect
+        );
+        modes
+    }
+
+    /// CR 601.2b + CR 700.2a: the reported Witherbloom Charm line. With the AI's
+    /// own two-mana rock the only permanent matching "nonland permanent with
+    /// mana value 2 or less", the Destroy mode can only blow up our own board,
+    /// so it must score below the beneficial GainLife mode.
+    #[test]
+    fn witherbloom_destroy_mode_penalised_when_only_own_permanent_matches() {
+        let mut state = make_state();
+        add_mana_rock(&mut state, PlayerId(0), "Dimir Signet", 2);
+        // The opponent's board is out of the filter's reach (mana value 4).
+        add_mana_rock(&mut state, PlayerId(1), "Coalition Relic", 4);
+        let modes = witherbloom_charm_modes();
+
+        let destroy = select_modes_score(&mut state, "Witherbloom Charm", &modes, vec![2]);
+        let gain_life = select_modes_score(&mut state, "Witherbloom Charm", &modes, vec![1]);
+
+        assert_eq!(
+            destroy,
+            AiConfig::default().policy_penalties.wasted_cast_penalty,
+            "a harmful mode whose filter reaches only our own board is a wasted mode"
+        );
+        assert_eq!(gain_life, 0.0, "the beneficial mode is not penalised");
+        assert!(destroy < gain_life);
+    }
+
+    /// The mirror: one opponent-controlled permanent inside the filter and the
+    /// arm stands down entirely — the mode is a real removal line and the AI
+    /// must be free to take it.
+    #[test]
+    fn witherbloom_destroy_mode_unpenalised_when_an_opponent_permanent_matches() {
+        let mut state = make_state();
+        add_mana_rock(&mut state, PlayerId(0), "Dimir Signet", 2);
+        add_mana_rock(&mut state, PlayerId(1), "Opposing Signet", 2);
+        let modes = witherbloom_charm_modes();
+
+        assert_eq!(
+            select_modes_score(&mut state, "Witherbloom Charm", &modes, vec![2]),
+            0.0,
+            "an opponent's permanent inside the mode's own filter makes it a real removal mode"
+        );
+    }
+
+    const ORZHOV_CHARM_ORACLE: &str = "Choose one —\n\
+         • Return target creature you control and all Auras you control attached to it to their \
+         owner's hand.\n\
+         • Destroy target creature and you lose life equal to its toughness.\n\
+         • Return target creature card with mana value 1 or less from your graveyard to the \
+         battlefield.";
+
+    /// A `controller: You` filter can never match an opponent's permanent, so
+    /// "no opponent matched" is vacuously true and the mode would be penalised
+    /// unconditionally. Orzhov Charm's self-bounce mode IS aimed at our own
+    /// board by design (re-buy an ETB, dodge removal). REVERT-FAILING: without
+    /// the `filter_can_reach_an_opponent` guard this scores the wasted-cast
+    /// penalty even with an opposing creature sitting on the battlefield.
+    #[test]
+    fn self_scoped_harmful_mode_is_not_penalised() {
+        let mut state = make_state();
+        add_creature(&mut state, PlayerId(0), "Blood Artist", 0, 1);
+        add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+
+        let modes = parsed_abilities("Orzhov Charm", ORZHOV_CHARM_ORACLE, &[], &["Instant"]);
+        assert_eq!(modes.len(), 3, "three printed modes: {modes:?}");
+        let Effect::Bounce { target, .. } = &*modes[0].effect else {
+            panic!("mode 1 must still parse as a Bounce: {:?}", modes[0].effect);
+        };
+        assert!(
+            matches!(
+                target,
+                TargetFilter::Typed(typed)
+                    if matches!(typed.controller, Some(ControllerRef::You))
+            ),
+            "the fixture is only meaningful while mode 1 is self-scoped: {target:?}"
+        );
+
+        assert_eq!(
+            select_modes_score(&mut state, "Orzhov Charm", &modes, vec![0]),
+            0.0,
+            "a mode that can only ever name our own permanents is the play, not a whiff"
+        );
+    }
+
+    /// The scan is board-wide, so it is root-only: inside lookahead the
+    /// resulting-state eval already prices the branch and the policy must be
+    /// free (the documented `at_root` discipline for board-walking policies).
+    #[test]
+    fn select_modes_arm_is_root_only() {
+        let mut state = make_state();
+        add_mana_rock(&mut state, PlayerId(0), "Dimir Signet", 2);
+        let modes = witherbloom_charm_modes();
+
+        let card_id = CardId(state.next_object_id);
+        let source_id = create_object(
+            &mut state,
+            card_id,
+            PlayerId(0),
+            "Witherbloom Charm".to_string(),
+            Zone::Stack,
+        );
+        let object = state.objects.get_mut(&source_id).unwrap();
+        object.card_types.core_types.push(CoreType::Instant);
+        *Arc::make_mut(&mut object.abilities) = modes.clone();
+
+        let resolved = build_resolved_from_def(&modes[0], source_id, PlayerId(0));
+        let pending_cast = PendingCast::new(source_id, card_id, resolved, ManaCost::zero());
+        let decision = AiDecisionContext {
+            waiting_for: WaitingFor::ModeChoice {
+                player: PlayerId(0),
+                modal: ModalChoice {
+                    min_choices: 1,
+                    max_choices: 1,
+                    mode_count: 3,
+                    ..ModalChoice::default()
+                },
+                pending_cast: Box::new(pending_cast),
+                unavailable_modes: Vec::new(),
+            },
+            candidates: Vec::new(),
+        };
+        let candidate = CandidateAction {
+            action: GameAction::SelectModes { indices: vec![2] },
+            metadata: ActionMetadata::for_actor(Some(PlayerId(0)), TacticalClass::Selection),
+        };
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Lookahead,
+        };
+        assert_eq!(
+            AntiSelfHarmPolicy.score(&ctx),
+            0.0,
+            "the battlefield scan must not run in lookahead"
+        );
     }
 }

@@ -33,8 +33,17 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
   new Set<WaitingFor["type"]>([
     // Active priority — passes via PassButton / mana payment / cast.
     "Priority",
+    // Resolve All's explicit standing-pass authorization. The final Grant
+    // materializes the shared engine session directly; there is no client-side
+    // Ready hand-off to drive.
+    "ResolveAllConsent",
+    // CR 701.42 / CR 508.4: meld pair and attacking-entry destination dialogs.
+    "MeldPairChoice",
+    "MeldAttackTargetChoice",
+    "EntryAttackTargetChoice",
     // Cast / activation chain — ManaPayment + PhyrexianPayment share ManaPaymentUI.
     ...MANA_PAYMENT_WAITING_FOR_TYPES,
+    "ManaSourceSelection",
     "ChooseXValue",
     "PayAmountChoice",
     "TargetSelection",
@@ -80,19 +89,28 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "CombatTaxPayment",
     // Triggers / resolution-time choices
     "OrderTriggers",
+    // CR 732.2a/b/c: interactive loop-shortcut declare + accept-or-shorten
+    // (DeclareShortcutModal / RespondToShortcutModal).
+    "LoopShortcut",
+    "RespondToShortcut",
+    "PrecastCopyShortcutOffer",
+    "RespondToPrecastCopyShortcut",
     "ReplacementChoice",
+    "EntryControllerChoice",
     "CopyTargetChoice",
     "CopyRetarget",
     "ExploreChoice",
     // CR 303.4 + CR 115.1: return-as-Aura / non-spell Aura entry host pick.
     // Resolved on the board (object hosts) or via player HUD glow (Curse /
-    // enchant-player Auras) — see TargetingOverlay + PlayerHud/OpponentHud.
+    // enchant-player Auras). Legal picks come from `getWaitingForClickTargetRefs`
+    // (viewmodel/gameStateView.ts), which every click surface reads.
     "ReturnAsAuraTarget",
     "EquipTarget",
     "CrewVehicle",
     "StationTarget",
     "SaddleMount",
     "ScryChoice",
+    "ArrangePlanarDeckTopChoice",
     "CoinFlipKeepChoice",
     "DigChoice",
     "SurveilChoice",
@@ -101,6 +119,9 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "SearchPartitionChoice",
     "OutsideGameChoice",
     "ChooseFromZoneChoice",
+    // CR 701.4a: behold a [quality] — single-pick from a mixed-zone candidate
+    // list (BeholdChoiceModal, rendered via CardChoiceModal).
+    "BeholdChoice",
     "ChooseOneOfBranch",
     "ConniveDiscard",
     "DiscardChoice",
@@ -110,6 +131,11 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "SpellbookDraft",
     "ManifestDreadChoice",
     "ClashChooseOpponent",
+    // CR 608.2d: "an opponent chooses" from a zone — the controller picks the
+    // choosing opponent (ZoneOpponentChooserModal).
+    "ChooseFromZoneOpponentChooser",
+    "ChooseAnnouncingOpponent",
+    "ChooseGiftRecipient",
     "ClashCardPlacement",
     // CR 702.132a: Assist — caster picks a helper (AssistChoosePlayerModal),
     // then the helper commits generic mana (AssistPaymentUI).
@@ -120,9 +146,17 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "TimeTravelChoice",
     "ChooseObjectsSelection",
     "CategoryChoice",
+    "EachPlayerCopyChosenSelection",
     "KeepWithinTotalPowerChoice",
+    "KeepExactPermanentsChoice",
     "DistributeAmong",
+    // CR 119.7 + CR 119.8: controller-chosen life-total redistribution permutation
+    // (Reverse the Sands, The Doctor's Tomb) — rendered by LifeRedistributionModal.
+    "RedistributeLifeTotals",
     "MoveCountersDistribution",
+    // CR 107.1c: "remove any number of counters" (Rhys, Tetravus) — rendered by
+    // MoveCountersDistributionModal in no-destination removal mode.
+    "RemoveCountersChoice",
     "RetargetChoice",
     "CopyRetarget",
     "DamageSourceChoice",
@@ -132,6 +166,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "PairChoice",
     "OpponentMayChoice",
     "OptionalEffectChoice",
+    "ResolutionOptionalPaymentChoice",
     "UnlessPayment",
     "UnlessPaymentChooseCost",
     "WardDiscardChoice",
@@ -140,6 +175,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "RevealUntilKeptChoice",
     "RepeatDecision",
     "VoteChoice",
+    "SeparatePilesChooseOpponent",
     "SeparatePilesPartition",
     "SeparatePilesChoice",
     "ChooseRingBearer",
@@ -152,6 +188,8 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "CommanderZoneChoice",
     "BattleProtectorChoice",
     "NamedChoice",
+    "OpponentGuess",
+    "CostTypeChoice",
     "UntapChoice",
     "ChooseUntapSubset",
     "ExertChoice",
@@ -160,7 +198,6 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     // Game lifecycle
     "GameOver",
     "MulliganDecision",
-    "MulliganBottomCards",
     "OpeningHandBottomCards",
     "BetweenGamesSideboard",
     "BetweenGamesChoosePlayDraw",
@@ -219,13 +256,13 @@ export function waitingForReason(
     case "RetargetChoice":
       return { key: "status.reason.choosingTargets" };
     case "ManaPayment":
+    case "ManaSourceSelection":
     case "PhyrexianPayment":
     case "PayCost":
     case "PayManaAbilityMana":
     case "UnlessPayment":
       return { key: "status.reason.payingCost" };
     case "MulliganDecision":
-    case "MulliganBottomCards":
     case "OpeningHandBottomCards":
       return { key: "status.reason.mulligan" };
     case "DiscardToHandSize":
@@ -256,4 +293,17 @@ export function waitingForReason(
     default:
       return { key: "status.reason.thinking" };
   }
+}
+
+/**
+ * Map a reason to its standalone seat-badge key. `status.seat.*` mirrors
+ * `status.reason.*` key-for-key but holds self-contained chip labels
+ * ("Responding") instead of sentence fragments meant for composition
+ * ("Your priority — responding to the stack").
+ */
+export function seatStatusKey(reason: WaitingReason | null): string {
+  return (reason?.key ?? "status.reason.thinking").replace(
+    "status.reason.",
+    "status.seat.",
+  );
 }

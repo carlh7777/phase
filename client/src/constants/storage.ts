@@ -1,12 +1,20 @@
 import { isCommanderBracket, type CommanderBracket } from "../types/bracket";
 import type { FeedSubscription } from "../types/feed";
 import { repairParsedDeck, type ParsedDeck } from "../services/deckParser";
+import { projectSavedDeckSpecialSlots } from "../services/savedDeckProjection";
 
 /** Prefix for saved deck data in localStorage. Full key: `${STORAGE_KEY_PREFIX}${deckName}` */
 export const STORAGE_KEY_PREFIX = "phase-deck:";
 
 /** Key for the currently selected/active deck name in localStorage */
 export const ACTIVE_DECK_KEY = "phase-active-deck";
+
+/** Sentinel stored as the active deck when setup should randomize at game start. */
+export const RANDOM_DECK_SELECTION = "__phase_random_deck__";
+
+export function isRandomDeckSelection(deckName: string | null | undefined): deckName is typeof RANDOM_DECK_SELECTION {
+  return deckName === RANDOM_DECK_SELECTION;
+}
 
 /** Prefix for per-game saved state. Full key: `${GAME_KEY_PREFIX}${gameId}` */
 export const GAME_KEY_PREFIX = "phase-game:";
@@ -46,6 +54,13 @@ export const ACTIVE_QUICK_DRAFT_KEY = "phase-active-quick-draft";
 /** Key for active draft-pod metadata in localStorage (synchronous resume detection) */
 export const ACTIVE_DRAFT_POD_KEY = "phase-active-draft-pod";
 
+/**
+ * Non-secret pointer to the most recent guest draft. The reconnect capability
+ * itself remains in IndexedDB; this record exists only so a reloaded guest can
+ * find the pod again from its room code.
+ */
+export const ACTIVE_DRAFT_GUEST_KEY = "phase-active-draft-guest";
+
 /** Prefix for quick-draft session blobs in IndexedDB. Full key: `${QUICK_DRAFT_KEY_PREFIX}${draftId}` */
 export const QUICK_DRAFT_KEY_PREFIX = "phase-quick-draft:";
 
@@ -54,6 +69,9 @@ export const DRAFT_RUN_KEY_PREFIX = "phase-draft-run:";
 
 /** localStorage key for the Zustand-persisted preferences store. */
 export const PREFERENCES_KEY = "phase-preferences";
+
+/** localStorage key for personal draft workspace preferences. */
+export const DRAFT_WORKSPACE_PREFERENCES_KEY = "phase-draft-workspace-preferences";
 
 /**
  * Single authority for "is this localStorage key part of the user's portable
@@ -68,6 +86,7 @@ export const PREFERENCES_KEY = "phase-preferences";
 export function isUserOwnedStorageKey(key: string): boolean {
   return (
     key === PREFERENCES_KEY ||
+    key === DRAFT_WORKSPACE_PREFERENCES_KEY ||
     key === DECK_METADATA_KEY ||
     key === DECK_FOLDERS_KEY ||
     key === ACTIVE_DECK_KEY ||
@@ -133,6 +152,7 @@ export function stampDeckMeta(deckName: string, addedAt?: number): void {
 
 /** Update the lastPlayedAt timestamp for a deck. Call when starting a game. */
 export function touchDeckPlayed(deckName: string): void {
+  if (isRandomDeckSelection(deckName)) return;
   const store = loadMetadataStore();
   const existing = store[deckName];
   // Spread the existing entry so folder/star membership survives a play.
@@ -299,17 +319,27 @@ export function deleteFolder(id: string): void {
  * well-formed even if the migration hasn't run yet.
  */
 export function loadSavedDeck(deckName: string): ParsedDeck | null {
+  if (isRandomDeckSelection(deckName)) return null;
   const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
   if (!raw) return null;
   try {
     const parsed = JSON.parse(raw) as ParsedDeck & Record<string, unknown>;
-    const repaired = repairParsedDeck(parsed);
-    if (parsed.companion && !repaired.sideboard.some((e) => e.name === parsed.companion)) {
-      repaired.sideboard.push({ count: 1, name: parsed.companion });
-    }
-    return repaired;
+    return projectSavedDeckSpecialSlots(parsed, repairParsedDeck(parsed));
   } catch {
     return null;
+  }
+}
+
+/** Read the persisted deck-construction format without projecting deck data. */
+export function loadSavedDeckFormat(deckName: string): string | undefined {
+  if (isRandomDeckSelection(deckName)) return undefined;
+  const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as { format?: unknown };
+    return typeof parsed.format === "string" ? parsed.format : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -321,6 +351,7 @@ export function loadSavedDeck(deckName: string): ParsedDeck | null {
  * an invalid value.
  */
 export function loadSavedDeckBracket(deckName: string): CommanderBracket | null {
+  if (isRandomDeckSelection(deckName)) return null;
   const raw = localStorage.getItem(STORAGE_KEY_PREFIX + deckName);
   if (!raw) return null;
   try {

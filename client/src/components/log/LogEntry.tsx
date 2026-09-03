@@ -5,28 +5,28 @@ import { getSeatColor } from "../../hooks/useSeatColor.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { getPlayerDisplayName } from "../../stores/multiplayerStore.ts";
 import { assertNever } from "../../utils/assertNever.ts";
-import { categoryColorClass } from "../../viewmodel/logFormatting.ts";
+import { logPresentation, toneClass } from "../../viewmodel/logFormatting.ts";
 
 interface LogEntryProps {
   entry: GameLogEntry;
-  onInspectObject?: (objectId: ObjectId) => void;
+  onInspectObjectSticky?: (objectId: ObjectId) => void;
 }
 
 function renderSegment(
   segment: LogSegment,
   index: number,
   seatOrder: PlayerId[] | undefined,
-  onInspectObject?: (objectId: ObjectId) => void,
+  onInspectObjectSticky?: (objectId: ObjectId) => void,
 ) {
   switch (segment.type) {
     case "Text":
       return <span key={index}>{segment.value}</span>;
     case "CardName":
-      return onInspectObject ? (
+      return onInspectObjectSticky ? (
         <button
           key={index}
           type="button"
-          onClick={() => onInspectObject(segment.value.object_id)}
+          onClick={() => onInspectObjectSticky(segment.value.object_id)}
           className="font-semibold text-yellow-300 underline decoration-yellow-500/40 underline-offset-2 transition hover:text-yellow-200"
         >
           {segment.value.name}
@@ -79,16 +79,17 @@ function renderSegment(
 
 // Memoized: the log panel re-renders on every search keystroke, filter toggle,
 // and verbosity change. Entry objects are stable references (append-only log,
-// preserved through the filter pipeline) and onInspectObject is a stable store
-// action, so memo lets unchanged rows skip re-rendering on those panel updates.
-export const LogEntry = memo(function LogEntry({ entry, onInspectObject }: LogEntryProps) {
-  const colorClass = categoryColorClass(entry);
+// preserved through the filter pipeline) and onInspectObjectSticky is a stable
+// store action, so memo lets unchanged rows skip re-rendering on those panel updates.
+export const LogEntry = memo(function LogEntry({ entry, onInspectObjectSticky }: LogEntryProps) {
+  const presentation = logPresentation(entry);
+  const colorClass = toneClass(presentation.tone);
   const seatOrder = useGameStore((s) => s.gameState?.seat_order);
 
   return (
-    <div className={`border-b border-gray-800 py-0.5 font-mono text-[10px] ${colorClass}`}>
+    <div data-tone={presentation.tone} className={`border-b border-l border-gray-800 py-0.5 pl-1 font-mono text-[10px] ${colorClass}`}>
       {entry.segments.map((segment, index) =>
-        renderSegment(segment, index, seatOrder, onInspectObject),
+        renderSegment(segment, index, seatOrder, onInspectObjectSticky),
       )}
     </div>
   );

@@ -1,51 +1,86 @@
 import path from "node:path";
 import type { Plugin } from "vite";
 import { defineConfig } from "vitest/config";
+import { resolveMultiplayerServerUrls } from "./src/config/multiplayerServerUrls";
+
+const multiplayerServers = resolveMultiplayerServerUrls((name) => process.env[name]);
 
 /**
- * Resolves @wasm/engine to the real WASM build artifact when present,
- * otherwise to a virtual empty module. This allows vi.mock("@wasm/engine", factory)
- * to work on CI where WASM build artifacts are absent (gitignored).
+ * Resolves the @wasm/* aliases to the real WASM build artifacts when present,
+ * otherwise to a virtual empty module. Vitest does not inherit vite.config.ts
+ * aliases, and the artifacts are gitignored (absent on CI), so without this
+ * any test whose import graph reaches a `import("@wasm/...")` fails at
+ * transform time. The stub also lets vi.mock("@wasm/engine", factory) work.
  */
 function wasmStubPlugin(): Plugin {
-  const resolved = path.resolve(__dirname, "src/wasm/engine_wasm.js");
-  const virtualId = "\0@wasm/engine-stub";
+  const artifacts: Record<string, string> = {
+    "@wasm/engine": path.resolve(__dirname, "src/wasm/engine_wasm.js"),
+    "@wasm/draft": path.resolve(__dirname, "src/wasm/draft_wasm.js"),
+  };
   return {
     name: "wasm-stub",
     enforce: "pre",
     async resolveId(id) {
-      if (id === "@wasm/engine") {
-        try {
-          await import("node:fs/promises").then((fs) => fs.access(resolved));
-          return resolved;
-        } catch {
-          return virtualId;
-        }
+      const artifact = artifacts[id];
+      if (!artifact) return;
+      try {
+        await import("node:fs/promises").then((fs) => fs.access(artifact));
+        return artifact;
+      } catch {
+        return `\0${id}-stub`;
       }
     },
     load(id) {
-      if (id === virtualId) {
+      if (id.startsWith("\0@wasm/") && id.endsWith("-stub")) {
         return "export default function init() {}";
       }
     },
   };
 }
 
+/** `virtual:pwa-register` is supplied by VitePWA in production but Vitest
+ * does not load that plugin. Keep the stub resolvable so updater tests can
+ * replace it with the same module contract. */
+function pwaRegisterStubPlugin(): Plugin {
+  const id = "\0virtual:pwa-register-stub";
+  return {
+    name: "pwa-register-stub",
+    resolveId(source) {
+      return source === "virtual:pwa-register" ? id : undefined;
+    },
+    load(source) {
+      return source === id ? "export const registerSW = () => async () => {};" : undefined;
+    },
+  };
+}
+
 export default defineConfig({
-  plugins: [wasmStubPlugin()],
+  plugins: [wasmStubPlugin(), pwaRegisterStubPlugin()],
   define: {
     __SCRYFALL_DATA_URL__: JSON.stringify("/scryfall-data.json"),
     __SCRYFALL_TOKEN_IMAGES_URL__: JSON.stringify("/scryfall-token-images.json"),
     __SCRYFALL_PRINTINGS_URL__: JSON.stringify("/scryfall-printings.json"),
     __SCRYFALL_SETS_URL__: JSON.stringify("/scryfall-sets.json"),
+    __DRAFT_POOLS_URL__: JSON.stringify("/draft-pools.json"),
     __DECKS_URL__: JSON.stringify("/decks.json"),
     __CARD_DATA_URL__: JSON.stringify("/card-data.json"),
     __CARD_DATA_LOCALE_URL_TEMPLATE__: JSON.stringify("/card-data.{lng}.json"),
+    __SCRYFALL_IMAGES_LOCALE_URL_TEMPLATE__: JSON.stringify("/scryfall-images.v2.{lng}.json"),
     __CHANGELOG_URL__: JSON.stringify("/changelog.json"),
     __CHANGELOG_META_URL__: JSON.stringify("/changelog-meta.json"),
+    __STATUS_URL__: JSON.stringify("/status.json"),
     __APP_VERSION__: JSON.stringify("0.0.0-test"),
     __BUILD_HASH__: JSON.stringify("testhash"),
+    __ENGINE_WASM_URL__: "undefined",
+    // Same resolver vite.config.ts uses — the order is single-authority.
+    __OFFICIAL_MULTIPLAYER_SERVER_URL__: JSON.stringify(multiplayerServers.official),
+    __DEFAULT_MULTIPLAYER_SERVER_URL__: JSON.stringify(multiplayerServers.buildDefault),
     __GIT_REPO_URL__: JSON.stringify("https://github.com/phase-rs/phase"),
+    __PREVIEW_SITE_URL__: JSON.stringify("https://preview.phase-rs.dev"),
+    __RELEASE_SITE_URL__: JSON.stringify("https://phase-rs.dev"),
+    __IS_RELEASE_BUILD__: JSON.stringify(false),
+    // Empty ⇒ telemetry is build-disabled in tests (no network egress).
+    __TELEMETRY_URL__: JSON.stringify(""),
   },
   test: {
     environment: "happy-dom",

@@ -3,6 +3,9 @@ import { BrowserRouter, Routes, Route, useSearchParams } from "react-router";
 
 import { AppShell } from "./components/chrome/AppShell";
 import { AppToast } from "./components/chrome/AppToast";
+import { NativeEngineProgressOverlay } from "./components/chrome/NativeEngineProgressOverlay";
+import { RouteTelemetry } from "./components/chrome/RouteTelemetry";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { HostControlTile } from "./components/chrome/HostControlTile";
 import { EngineLostModal } from "./components/modal/EngineLostModal";
 import { NonFatalPanicToast } from "./components/modal/NonFatalPanicToast";
@@ -11,6 +14,7 @@ import { SplashScreen } from "./components/splash/SplashScreen";
 import { useFeedInitialization } from "./hooks/useFeedInitialization";
 import { useHostingSession } from "./hooks/useHostingSession";
 import { migrateSavedDecks } from "./services/deckMigrations";
+import { useDeckLibraryAutoSync } from "./services/visualPacks/deckLibraryAutoSync";
 import { ensurePreload, subscribePreload } from "./startup/preloadAssets";
 import { useCloudSyncStore } from "./stores/cloudSyncStore";
 import { MenuPage } from "./pages/MenuPage";
@@ -31,6 +35,7 @@ const DraftPodPage = lazy(() => import("./pages/DraftPodPage").then((m) => ({ de
 const DraftSpectatorPage = lazy(() =>
   import("./pages/DraftSpectatorPage").then((m) => ({ default: m.DraftSpectatorPage })),
 );
+const ReplayPage = lazy(() => import("./pages/ReplayPage").then((m) => ({ default: m.ReplayPage })));
 
 function DevStrict({ children }: { children: ReactNode }) {
   if (!import.meta.env.DEV) return children;
@@ -74,6 +79,8 @@ function AppContent() {
   // unmount / hot reload rather than stacking.
   useEffect(() => useCloudSyncStore.getState().init(), []);
 
+  useDeckLibraryAutoSync();
+
   const [showSplash, setShowSplash] = useState(true);
   const [progress, setProgress] = useState(0);
   const [loadLabel, setLoadLabel] = useState("Loading...");
@@ -97,9 +104,11 @@ function AppContent() {
 
   return (
     <div className="min-h-screen bg-gray-950 text-white">
+      <RouteTelemetry />
       {showSplash && (
         <SplashScreen progress={progress} onComplete={handleSplashComplete} label={loadLabel} />
       )}
+      <ErrorBoundary>
       <Suspense fallback={<div className="flex min-h-screen items-center justify-center"><div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-500 border-t-white" /></div>}>
         <Routes>
           {/* Modern app shell (rail + tab bar + single scene) wraps every
@@ -117,10 +126,13 @@ function AppContent() {
             <Route path="/draft-spectator" element={<DraftSpectatorPage />} />
           </Route>
           <Route path="/game/:id" element={<GameRouteElement />} />
+          <Route path="/replay" element={<ReplayPage />} />
         </Routes>
       </Suspense>
+      </ErrorBoundary>
       <HostControlTile />
       <AppToast />
+      <NativeEngineProgressOverlay />
       <EngineLostModal />
       <NonFatalPanicToast />
       <StuckDecisionToast />

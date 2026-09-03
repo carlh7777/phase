@@ -19,9 +19,10 @@ import { DeckBuilderToolbar } from "./DeckBuilderToolbar";
 import { DeckBuilderTabBar } from "./DeckBuilderTabBar";
 import { panelId, tabId } from "./deckBuilderTabs";
 import { useDeckBuilder } from "./useDeckBuilder";
+import type { CardHoverInfo } from "../card/CardPreview";
 
 interface DeckBuilderProps {
-  onCardHover?: (cardName: string | null, scryfallId?: string) => void;
+  onCardHover?: (card: CardHoverInfo | null) => void;
   format: GameFormat;
   onFormatChange: (format: GameFormat) => void;
   initialDeckName?: string | null;
@@ -68,7 +69,7 @@ export function DeckBuilder({
     setListPickerCard,
     currentDeck,
     isCommander,
-    expectedDeckSize,
+    deckSizeRule,
     estimate,
     auditEmptyReason,
     cmcValues,
@@ -85,6 +86,8 @@ export function DeckBuilder({
     handleAddCard,
     handleAddCardByName,
     handleRemoveCard,
+    handleIncrementCard,
+    canIncrement,
     handleMoveCard,
     handleImport,
     handleSave,
@@ -93,13 +96,21 @@ export function DeckBuilder({
     handleSetCommander,
     isCommanderEligible,
     handleRemoveCommander,
+    signatureSpellCandidates,
+    companionCandidateNames,
+    handleSetSignatureSpell,
+    handleRemoveSignatureSpell,
+    handleSetCompanion,
+    handleRemoveCompanion,
   } = useDeckBuilder({ format, onFormatChange, initialDeckName, searchFilters });
   const { t } = useTranslation("deck-builder");
 
   // Deck-first: the main canvas shows the deck unless a search is active, in
   // which case it shows the results grid (cleared via "Back to deck").
   const searchActive = hasSearchCriteria(searchFilters);
-  const deckCount = deck.main.reduce((sum, e) => sum + e.count, 0) + commanders.length;
+  const deckCount = deck.main.reduce((sum, e) => sum + e.count, 0)
+    + commanders.length
+    + (deck.signature_spell?.length ?? 0);
 
   // Filters are an inline sidebar (≥820px) / overlay sheet (below 820px), shown on
   // demand so the deck canvas owns the space by default. The 820px breakpoint
@@ -108,6 +119,22 @@ export function DeckBuilder({
   // (rail visible) — only the former gets dialog semantics + a focus trap.
   const isNarrow = useIsMobile(820);
   const filterPanelRef = useRef<HTMLDivElement>(null);
+  const deckPanelRef = useRef<HTMLElement>(null);
+  const listPickerReturnFocusRef = useRef<HTMLElement | SVGElement | null>(null);
+  const openListArtPicker = useCallback(
+    (cardName: string, launcher: HTMLButtonElement) => {
+      listPickerReturnFocusRef.current = launcher;
+      launcher.focus();
+      handleOpenArtPicker(cardName);
+    },
+    [handleOpenArtPicker],
+  );
+  const chooseListArtFromContextMenu = useCallback(() => {
+    // The context-menu item unmounts as the picker opens, so its labelled deck
+    // panel is the nearest durable return destination.
+    listPickerReturnFocusRef.current = deckPanelRef.current;
+    handleListChooseArt();
+  }, [handleListChooseArt]);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const filtersAsDialog = filtersOpen && isNarrow;
   useEffect(() => {
@@ -304,9 +331,11 @@ export function DeckBuilder({
             controlling tab is display:none, but aria-labelledby still resolves
             its name from the hidden node, so the region stays labelled). */}
         <section
+          ref={deckPanelRef}
           id={panelId("deck")}
           role="tabpanel"
           aria-labelledby={tabId("deck")}
+          tabIndex={-1}
           className={`${mainVisible} min-h-0 min-w-0 flex-1 flex-col`}
         >
           <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/8 px-3 py-2">
@@ -415,6 +444,8 @@ export function DeckBuilder({
                       <DeckList
                         deck={currentDeck}
                         onRemoveCard={handleRemoveCard}
+                        onIncrementCard={handleIncrementCard}
+                        canIncrementCard={canIncrement}
                         onMoveCard={handleMoveCard}
                         onImport={handleImport}
                         onCardHover={onCardHover}
@@ -425,7 +456,7 @@ export function DeckBuilder({
                         onChooseArt={handleListContextMenu}
                         onSetAsCommander={isCommander ? handleSetCommander : undefined}
                         isCommanderEligible={isCommander ? isCommanderEligible : undefined}
-                        onOpenArtPicker={handleOpenArtPicker}
+                        onOpenArtPicker={openListArtPicker}
                         commanders={commanders}
                         onRemoveCommander={handleRemoveCommander}
                       />
@@ -437,11 +468,13 @@ export function DeckBuilder({
                       cardDataCache={cardDataCache}
                       groupMode={groupMode}
                       onAddCard={handleAddCardByName}
+                      canAddCard={canIncrement}
                       onRemoveCard={handleRemoveCard}
                       onMoveCard={handleMoveCard}
                       onRemoveCommander={handleRemoveCommander}
                       onCardHover={onCardHover}
                       format={format}
+                      pickerReturnFocusRef={deckPanelRef}
                     />
                   )}
                 </div>
@@ -462,11 +495,20 @@ export function DeckBuilder({
               <CommanderPanel
                 commanders={commanders}
                 deck={deck.main}
+                deckComposition="commanders-outside"
                 cardDataCache={cardDataCache}
-                expectedDeckSize={expectedDeckSize}
+                deckSizeRule={deckSizeRule}
                 isCommanderEligible={isCommanderEligible}
                 onSetCommander={handleSetCommander}
                 onRemoveCommander={handleRemoveCommander}
+                signatureSpell={deck.signature_spell?.[0]}
+                signatureSpellCandidates={signatureSpellCandidates}
+                onSetSignatureSpell={handleSetSignatureSpell}
+                onRemoveSignatureSpell={handleRemoveSignatureSpell}
+                companion={deck.companion}
+                companionCandidates={companionCandidateNames}
+                onSetCompanion={handleSetCompanion}
+                onRemoveCompanion={handleRemoveCompanion}
                 onCardHover={onCardHover}
                 formatValidationReasons={compatibility?.selected_format_reasons}
               />
@@ -493,7 +535,7 @@ export function DeckBuilder({
           cardName={listContextMenu.cardName}
           hasOverride={!!artOverrides[resolveOracleIdSync(listContextMenu.cardName) ?? ""]}
           hasAlternates={hasAlternatePrintingsSync(resolveOracleIdSync(listContextMenu.cardName) ?? "")}
-          onChooseArt={handleListChooseArt}
+          onChooseArt={chooseListArtFromContextMenu}
           onClearOverride={handleListClearOverride}
           onClose={() => setListContextMenu(null)}
         />
@@ -505,6 +547,7 @@ export function DeckBuilder({
           oracleId={listPickerCard.oracleId}
           onCardHover={onCardHover}
           onClose={() => setListPickerCard(null)}
+          returnFocusRef={listPickerReturnFocusRef}
         />
       )}
 

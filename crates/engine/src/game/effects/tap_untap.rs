@@ -5,10 +5,12 @@ use crate::types::ability::{
     Effect, EffectError, EffectKind, EffectScope, ResolvedAbility, TapStateChange,
     TargetChoiceTiming, TargetFilter, TargetRef,
 };
+use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::proposed_event::ProposedEvent;
+use crate::types::resolved_commands::ResolvedObjectStatus;
 use crate::types::zones::Zone;
 
 /// CR 603.7e + CR 608.2c: Resolve the objects a `Tap`/`Untap` effect acts on.
@@ -39,6 +41,11 @@ fn tap_untap_target_ids(
 ) -> Vec<ObjectId> {
     match effect_target {
         TargetFilter::SelfRef => vec![ability.source_id],
+        // CR 700.2 + CR 608.2c: "highest id" == "the set the currently-resolving
+        // instruction published" — the ordering argument is written once, on
+        // `effects::publish_tracked_set`. Deliberately not routed through
+        // `targeting::resolve_tracked_set_id`: that authority SKIPS empty sets, and
+        // under mode scoping not skipping is the correct semantics here.
         TargetFilter::TrackedSet {
             id: TrackedSetId(0),
         } => state
@@ -52,8 +59,23 @@ fn tap_untap_target_ids(
             .get(id)
             .cloned()
             .unwrap_or_default(),
+        // CR 400.7 + CR 603.7c: a delayed tap/untap whose pinned referent became
+        // a new object taps nothing. This arm is a RAW read that never reaches
+        // `resolved_targets`, so the targeting chokepoint cannot see this pin.
+        //
+        // SUBSTITUTION-ONLY, and that is verified rather than assumed against
+        // the decision rule: there is no source fallback below this arm, an
+        // empty vector simply skips `resolve_set_tap_state`'s resolution loop,
+        // and control falls to that function's UNCONDITIONAL
+        // `EffectResolved` push (`:135-139`). An emptied list is already a
+        // clean no-op that emits the event, so no early return is needed.
+        //
+        // No slot carve-out applies: this arm enumerates every object ref via
+        // `filter_map` and never hands the list to `effect_object_targets`'s
+        // positional indexer, so a filtered list cannot renumber a
+        // `ParentTargetSlot`.
         _ => ability
-            .targets
+            .live_object_targets(state)
             .iter()
             .filter_map(|t| match t {
                 TargetRef::Object(id) => Some(*id),
@@ -133,6 +155,7 @@ fn resolve_single(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -149,6 +172,14 @@ pub(crate) fn process_one_tap(
     source_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> Result<TapUntapOutcome, EffectError> {
+    // CR 701.26a + CR 508.1f: an effect can't tap a permanent with a "can't become
+    // tapped" restriction (Ood Sphere's ruling: goaded creatures "can't be tapped
+    // by effects"). The tap simply doesn't happen — return Complete as the
+    // `Prevented` arm below does. Attacker declaration (CR 508.1f) never routes
+    // here, so a restricted creature still taps by attacking.
+    if crate::game::restrictions::object_cant_tap(state, object_id) {
+        return Ok(TapUntapOutcome::Complete);
+    }
     let proposed = ProposedEvent::Tap {
         object_id,
         applied: HashSet::new(),
@@ -157,15 +188,19 @@ pub(crate) fn process_one_tap(
     match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(event) => {
             if let ProposedEvent::Tap { object_id, .. } = event {
-                let obj = state
-                    .objects
-                    .get_mut(&object_id)
-                    .ok_or(EffectError::ObjectNotFound(object_id))?;
-                obj.tapped = true;
-                events.push(GameEvent::PermanentTapped {
+                if crate::game::object_state::resolve_and_apply_object_edit(
+                    state,
                     object_id,
-                    caused_by: Some(source_id),
-                });
+                    ResolvedObjectStatus::Tapped,
+                    true,
+                )
+                .map_err(|_| EffectError::ObjectNotFound(object_id))?
+                {
+                    events.push(GameEvent::PermanentTapped {
+                        object_id,
+                        caused_by: Some(source_id),
+                    });
+                }
             }
             Ok(TapUntapOutcome::Complete)
         }
@@ -187,12 +222,49 @@ pub(crate) fn process_one_untap(
     match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(event) => {
             if let ProposedEvent::Untap { object_id, .. } = event {
-                let obj = state
+                let has_stun = state
                     .objects
-                    .get_mut(&object_id)
-                    .ok_or(EffectError::ObjectNotFound(object_id))?;
-                obj.tapped = false;
-                events.push(GameEvent::PermanentUntapped { object_id });
+                    .get(&object_id)
+                    .ok_or(EffectError::ObjectNotFound(object_id))?
+                    .counters
+                    .contains_key(&CounterType::Stun);
+                // CR 122.1d: any attempted untap, including an effect-driven
+                // untap, removes one stun counter instead. CR 101.2 keeps the
+                // permanent tapped when counter removal is prohibited.
+                if has_stun {
+                    if !super::counters::counter_removal_blocked(
+                        state,
+                        object_id,
+                        &CounterType::Stun,
+                    ) {
+                        let obj = state
+                            .objects
+                            .get_mut(&object_id)
+                            .ok_or(EffectError::ObjectNotFound(object_id))?;
+                        if let Some(count) = obj.counters.get_mut(&CounterType::Stun) {
+                            *count -= 1;
+                            if *count == 0 {
+                                obj.counters.remove(&CounterType::Stun);
+                            }
+                        }
+                        events.push(GameEvent::CounterRemoved {
+                            object_id,
+                            counter_type: CounterType::Stun,
+                            count: 1,
+                        });
+                    }
+                } else {
+                    if crate::game::object_state::resolve_and_apply_object_edit(
+                        state,
+                        object_id,
+                        ResolvedObjectStatus::Tapped,
+                        false,
+                    )
+                    .map_err(|_| EffectError::ObjectNotFound(object_id))?
+                    {
+                        events.push(GameEvent::PermanentUntapped { object_id });
+                    }
+                }
             }
             Ok(TapUntapOutcome::Complete)
         }
@@ -223,19 +295,51 @@ fn prompt_resolution_tap_untap_choice(
         .copied()
         .filter(|id| crate::game::filter::matches_target_filter(state, *id, target, &ctx))
         .collect();
-    let Ok(bounds) = crate::game::ability_utils::resolve_multi_target_bounds(
+    let bounds = match crate::game::ability_utils::resolve_multi_target_bounds(
         state,
         ability,
         spec,
         eligible.len(),
-    ) else {
-        return false;
+    ) {
+        Ok(bounds) => bounds,
+        // CR 608.2b + CR 601.2c (issue #4961): `resolve_multi_target_bounds`
+        // errors when the eligible pool is smaller than the selection's required
+        // minimum. With zero eligible permanents that required tap/untap choice
+        // is vacuously impossible, so resolve it here — the single reachable
+        // no-candidate point — as a clean no-op. This keeps a resolution-time
+        // `EffectZoneChoice` from ever being built over an empty pool (which is
+        // the shape that wedges the game).
+        //
+        // But `resolve_multi_target_bounds` also errors *earlier* when the
+        // target count still needs a resolved quantity (an unresolved `X` /
+        // named-choice count, returned before the legal-target-count check).
+        // That is not a no-candidate situation and must NOT be silently treated
+        // as resolved — re-check the exact predicate and let it fall through to
+        // the normal target path (`return false`) so the unresolved-choice
+        // failure is preserved. A non-empty-but-under-filled pool likewise falls
+        // through so partial selections keep their existing behavior.
+        Err(_) => {
+            if eligible.is_empty()
+                && !crate::game::ability_utils::multi_target_needs_quantity_choice(
+                    state, ability, spec,
+                )
+            {
+                events.push(GameEvent::EffectResolved {
+                    kind: effect_kind,
+                    source_id: ability.source_id,
+                    subject: None,
+                });
+                return true;
+            }
+            return false;
+        }
     };
 
     if bounds.max == 0 && bounds.min == 0 {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),
             source_id: ability.source_id,
+            subject: None,
         });
         return true;
     }
@@ -262,8 +366,12 @@ fn prompt_resolution_tap_untap_choice(
         conditional_enter_with_counters: vec![],
         count_param: 0,
         library_position: None,
+        mass_library_order: None,
         is_cost_payment: false,
         enters_modified_if: None,
+        // Tap/untap selection performs no zone move, so no bounded-move
+        // duration rides the round-trip.
+        duration: None,
     };
     true
 }
@@ -306,6 +414,7 @@ fn resolve_all(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -619,6 +728,34 @@ mod tests {
     }
 
     #[test]
+    fn effect_untap_removes_one_stun_counter_and_leaves_permanent_tapped() {
+        let mut state = GameState::new_two_player(42);
+        let faerie = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sleep-Cursed Faerie".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&faerie).unwrap();
+        object.tapped = true;
+        object.counters.insert(CounterType::Stun, 2);
+        let mut events = Vec::new();
+
+        resolve_set_tap_state(&mut state, &make_untap_ability(faerie), &mut events).unwrap();
+
+        assert!(state.objects[&faerie].tapped);
+        assert_eq!(
+            state.objects[&faerie].counters.get(&CounterType::Stun),
+            Some(&1)
+        );
+        assert!(events.iter().any(|event| matches!(event, GameEvent::CounterRemoved { object_id, counter_type: CounterType::Stun, count: 1 } if *object_id == faerie)));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == faerie)));
+    }
+
+    #[test]
     fn resolution_timed_multi_untap_prompts_for_battlefield_lands() {
         let mut state = GameState::new_two_player(42);
         let land_a = create_object(
@@ -708,6 +845,162 @@ mod tests {
             other => panic!("expected EffectZoneChoice, got {other:?}"),
         }
         assert!(events.is_empty());
+    }
+
+    fn resolution_tap_choice_ability(seed_min: usize) -> ResolvedAbility {
+        use crate::types::ability::{ControllerRef, TypeFilter, TypedFilter};
+
+        let mut ability = ResolvedAbility::new(
+            Effect::SetTapState {
+                target: TargetFilter::Typed(
+                    TypedFilter::new(TypeFilter::Creature)
+                        .subtype("Zombie".to_string())
+                        .controller(ControllerRef::You),
+                ),
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.multi_target = Some(MultiTargetSpec::fixed(seed_min, seed_min));
+        ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        ability
+    }
+
+    /// Issue #4961: a resolution-time tap choice with a required minimum and
+    /// zero eligible permanents must resolve as a no-op via the reachable
+    /// no-candidate arm — `resolve_multi_target_bounds` errors first, so the
+    /// handling lives in that `Err` branch, not after it. Without the branch the
+    /// only thing preventing a wedge is the incidental empty-target fallthrough;
+    /// this asserts the intended path emits `EffectResolved` and never installs a
+    /// `WaitingFor` prompt.
+    #[test]
+    fn tap_untap_choice_with_no_eligible_permanents_does_not_deadlock() {
+        let mut state = GameState::new_two_player(4961);
+        let ability = resolution_tap_choice_ability(1);
+
+        let mut events = Vec::new();
+        resolve_set_tap_state(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "zero eligible tap targets must not wedge, got {:?}",
+            state.waiting_for
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::Tap,
+                    ..
+                }
+            )),
+            "no-op path must emit EffectResolved"
+        );
+    }
+
+    /// Guard the normal path: when the eligible pool DOES satisfy the required
+    /// minimum, the resolution-time choice must still be offered as an
+    /// `EffectZoneChoice` prompt (the #4961 no-op fix must not swallow real
+    /// selections).
+    #[test]
+    fn tap_untap_choice_with_eligible_permanents_still_prompts() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(4961);
+        let zombie = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Walking Corpse".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&zombie).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Zombie".to_string());
+        }
+        let ability = resolution_tap_choice_ability(1);
+
+        let mut events = Vec::new();
+        resolve_set_tap_state(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                cards, min_count, ..
+            } => {
+                assert_eq!(cards, &vec![zombie]);
+                assert_eq!(*min_count, 1);
+            }
+            other => panic!("expected an EffectZoneChoice prompt, got {other:?}"),
+        }
+    }
+
+    /// Issue #4961 (matthewevans review): the no-candidate no-op must be scoped
+    /// to the "not enough legal targets" empty-pool case. `resolve_multi_target_bounds`
+    /// *also* errors earlier — before the legal-target-count check — when the
+    /// target count still needs a resolved quantity (an unresolved `X`). That
+    /// unresolved-quantity error must NOT be swallowed as a resolved no-op even
+    /// when the pool is empty; it has to fall through to the normal target path
+    /// (`return false`) so the unresolved choice is preserved rather than
+    /// silently treated as done.
+    #[test]
+    fn tap_untap_choice_with_unresolved_x_count_is_not_treated_as_resolved() {
+        use crate::types::ability::{ControllerRef, QuantityExpr, QuantityRef};
+
+        let mut state = GameState::new_two_player(4961);
+        let target = TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature)
+                .subtype("Zombie".to_string())
+                .controller(ControllerRef::You),
+        );
+        let mut ability = ResolvedAbility::new(
+            Effect::SetTapState {
+                target: target.clone(),
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        // "tap X target creatures you control" with X not yet chosen: the count
+        // is an unresolved variable, so bounds resolution fails on the quantity
+        // gate rather than the empty-pool gate — even though no Zombie exists.
+        ability.multi_target = Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        }));
+        ability.target_choice_timing = TargetChoiceTiming::Resolution;
+        ability.chosen_x = None;
+
+        let mut events = Vec::new();
+        let handled = prompt_resolution_tap_untap_choice(
+            &mut state,
+            &ability,
+            &target,
+            EffectKind::Tap,
+            &mut events,
+        );
+
+        assert!(
+            !handled,
+            "unresolved-quantity error must not be handled as a no-op resolution"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, GameEvent::EffectResolved { .. })),
+            "unresolved-quantity path must not emit a resolved event, got {events:?}"
+        );
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "unresolved-quantity path must not install a zone choice, got {:?}",
+            state.waiting_for
+        );
     }
 
     #[test]
@@ -1254,6 +1547,110 @@ mod tests {
         assert!(
             !state.objects[&foe_creature].tapped,
             "the prohibition must lapse once we no longer control Spider-Woman (CR 611.2b)"
+        );
+    }
+
+    /// CR 611.2b presence sibling: Somnophore's untap lock states the
+    /// PRESENCE wording — "doesn't untap during its controller's untap step
+    /// for as long as Somnophore remains on the battlefield" — which lowers to
+    /// a `GenericEffect` transient carrying `WhileHostOnBattlefield` since the
+    /// second wording split. This is the PARITY pin for that split's shared
+    /// exit leg: the new variant must keep ending on the host's actual
+    /// battlefield exit exactly as the conflated variant did, or the split
+    /// strands every presence-bound untap lock forever.
+    ///
+    /// Revert-probe: dropping `WhileHostOnBattlefield` from
+    /// `Duration::ends_when_host_leaves_play`'s true arm leaves the transient
+    /// un-pruned at the exit — the final "untaps once Somnophore is gone"
+    /// assertion FAILS. The tapped assertions before it guard against the
+    /// vacuous opposite (no lock installed at all). The phase-out leg of the
+    /// same class is pinned by
+    /// `a_phased_out_host_ends_the_presence_effect_and_spares_the_event_deadline`.
+    #[test]
+    fn somnophore_untap_lock_keeps_its_gate_under_the_presence_wording() {
+        use crate::game::ability_utils::build_resolved_from_def_with_targets;
+        use crate::game::effects::resolve_ability_chain;
+        use crate::game::turns::execute_untap;
+
+        let mut state = GameState::new_two_player(42);
+        let somnophore = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Somnophore".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&somnophore)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let foe_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opposing Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&foe_creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let parsed = crate::parser::parse_oracle_text(
+            "Flying\nWhenever Somnophore deals damage to a player, tap target \
+             creature that player controls. That creature doesn't untap during \
+             its controller's untap step for as long as Somnophore remains on \
+             the battlefield.",
+            "Somnophore",
+            &["Flying".to_string()],
+            &["Creature".to_string()],
+            &["Illusion".to_string()],
+        );
+        let execute = parsed
+            .triggers
+            .first()
+            .expect("Somnophore must parse a damage trigger")
+            .execute
+            .as_deref()
+            .expect("the trigger must carry an effect chain");
+
+        let resolved = build_resolved_from_def_with_targets(
+            execute,
+            somnophore,
+            PlayerId(0),
+            vec![TargetRef::Object(foe_creature)],
+        );
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
+        assert!(
+            state.objects[&foe_creature].tapped,
+            "reach-guard: the trigger must tap the chosen creature"
+        );
+
+        // The lock holds through its controller's untap step while Somnophore
+        // is on the battlefield.
+        state.active_player = PlayerId(1);
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+        assert!(
+            state.objects[&foe_creature].tapped,
+            "the creature must stay tapped while Somnophore remains on the battlefield"
+        );
+
+        // CR 611.2b: once Somnophore leaves the battlefield, the stated
+        // lifetime is over and the next untap step unlocks the creature.
+        crate::game::zones::move_to_zone(&mut state, somnophore, Zone::Graveyard, &mut Vec::new());
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+        assert!(
+            !state.objects[&foe_creature].tapped,
+            "the lock must lapse once Somnophore has left the battlefield"
         );
     }
 
@@ -1834,6 +2231,238 @@ mod tests {
             values.replacement_definitions.contains(&printed_rider),
             "CR 707.2: a printed (non-gated) replacement IS a copiable value — the \
              filter must be selective, not a blanket drop"
+        );
+    }
+    /// CR 611.2a at the install seam, both halves of the refusal.
+    ///
+    /// **Which durations the seam represents.** Only
+    /// `Duration::WhileControllingHost` has an enforceable lifetime here: the
+    /// gate it promises is `ReplacementCondition::ControllerControlsSource`,
+    /// which ends on a control change. The presence reading
+    /// (`WhileHostOnBattlefield`) and the event deadline
+    /// (`UntilHostLeavesPlay`) both SURVIVE a control change while their source
+    /// stays on the battlefield, so wearing that gate would end them early —
+    /// a window shorter than printed, which CR 611.2a forbids exactly as much
+    /// as a longer one. Both therefore classify `Unsupported` and are refused,
+    /// on every replacement form including the bare untap rider.
+    ///
+    /// **How the refusal is delivered.** As a hard `EffectError`, not a
+    /// successful no-op. The previous revision returned `None` here and every
+    /// resolver arm turned that into `Ok(())` / `continue`, so a printed
+    /// replacement resolved into nothing while the card reported as supported.
+    /// The `unwrap_err` assertions below are the pin against that regressing:
+    /// an `unwrap()` here would pass again the moment the seam goes quiet.
+    ///
+    /// All three call sites of `replacement_with_ability_expiry` are driven
+    /// (floating `TargetFilter::None`, object target, player target), through
+    /// the production resolver `add_target_replacement::resolve`.
+    ///
+    /// REVERT-PROBES (measured, see the PR table): mapping the two non-control
+    /// durations back onto `GateControlled` reds the bare-untap-rider block;
+    /// restoring `Ok(())`/`continue` in the resolver arms reds every
+    /// `unwrap_err`; dropping the `host_gate_enforceable` check reds the
+    /// non-untap block. The positive control (control wording, bare untap
+    /// rider, installs WITH the gate) guards against a vacuous "refuses
+    /// everything".
+    #[test]
+    fn host_duration_on_non_untap_replacement_fails_closed() {
+        use crate::types::ability::{Duration, Effect, ReplacementCondition, ResolvedAbility};
+
+        let host_durations = [
+            Duration::WhileControllingHost,
+            Duration::UntilHostLeavesPlay,
+            Duration::WhileHostOnBattlefield,
+        ];
+
+        for duration in &host_durations {
+            let mut state = GameState::new_two_player(42);
+            let bear = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Test Bear".to_string(),
+                Zone::Battlefield,
+            );
+
+            // A `Moved` rider with NO parser-stamped expiry: exactly the shape
+            // that would install lifetime-less under the reverted arm.
+            let rider = crate::types::ability::ReplacementDefinition::new(
+                crate::types::replacements::ReplacementEvent::Moved,
+            )
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Graveyard);
+            let mut install = ResolvedAbility::new(
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(rider),
+                    target: TargetFilter::Any,
+                },
+                vec![TargetRef::Object(bear)],
+                ObjectId(0),
+                PlayerId(0),
+            );
+            install.duration = Some(duration.clone());
+            crate::game::effects::add_target_replacement::resolve(
+                &mut state,
+                &install,
+                &mut Vec::new(),
+            )
+            .expect_err(
+                "an unenforceable host-bound duration must FAIL the resolution, \
+                 not succeed with no effect",
+            );
+            assert_eq!(
+                state.objects[&bear]
+                    .replacement_definitions
+                    .iter_all()
+                    .count(),
+                0,
+                "{duration:?}: an unenforceable host-bound duration must refuse the install"
+            );
+            assert!(
+                state.objects[&bear].base_replacement_definitions.is_empty(),
+                "{duration:?}: nothing may reach the base store either"
+            );
+
+            // Floating (`TargetFilter::None`) path — same seam, other call site.
+            let floating = crate::types::ability::ReplacementDefinition::new(
+                crate::types::replacements::ReplacementEvent::DamageDone,
+            );
+            let mut float_install = ResolvedAbility::new(
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(floating),
+                    target: TargetFilter::None,
+                },
+                vec![],
+                ObjectId(0),
+                PlayerId(0),
+            );
+            float_install.duration = Some(duration.clone());
+            crate::game::effects::add_target_replacement::resolve(
+                &mut state,
+                &float_install,
+                &mut Vec::new(),
+            )
+            .expect_err("the floating call site must fail loudly too");
+            assert!(
+                state.pending_damage_replacements.is_empty(),
+                "{duration:?}: a floating rider with an unenforceable host-bound \
+                 duration must not reach pending_damage_replacements"
+            );
+
+            // Player-target path — the third call site of the same seam.
+            let player_rider = crate::types::ability::ReplacementDefinition::new(
+                crate::types::replacements::ReplacementEvent::DamageDone,
+            );
+            let mut player_install = ResolvedAbility::new(
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(player_rider),
+                    target: TargetFilter::Any,
+                },
+                vec![TargetRef::Player(PlayerId(1))],
+                ObjectId(0),
+                PlayerId(0),
+            );
+            player_install.duration = Some(duration.clone());
+            crate::game::effects::add_target_replacement::resolve(
+                &mut state,
+                &player_install,
+                &mut Vec::new(),
+            )
+            .expect_err("the player-target call site must fail loudly too");
+            assert!(
+                state.pending_damage_replacements.is_empty(),
+                "{duration:?}: a player-target rider with an unenforceable \
+                 host-bound duration must not reach pending_damage_replacements"
+            );
+        }
+
+        // CR 611.2a, the duration axis on its own: the bare untap rider — the
+        // ONE form the control gate can carry — is still refused under the two
+        // NON-control host wordings, because the gate would end them at a
+        // control change they are printed to survive.
+        for duration in [
+            Duration::UntilHostLeavesPlay,
+            Duration::WhileHostOnBattlefield,
+        ] {
+            let mut state = GameState::new_two_player(42);
+            let bear = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Test Bear".to_string(),
+                Zone::Battlefield,
+            );
+            let untap_rider = crate::types::ability::ReplacementDefinition::new(
+                crate::types::replacements::ReplacementEvent::Untap,
+            );
+            let mut install = ResolvedAbility::new(
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(untap_rider),
+                    target: TargetFilter::Any,
+                },
+                vec![TargetRef::Object(bear)],
+                ObjectId(0),
+                PlayerId(0),
+            );
+            install.duration = Some(duration.clone());
+            crate::game::effects::add_target_replacement::resolve(
+                &mut state,
+                &install,
+                &mut Vec::new(),
+            )
+            .expect_err("a non-control host wording must not be admitted through the CONTROL gate");
+            assert_eq!(
+                state.objects[&bear]
+                    .replacement_definitions
+                    .iter_all()
+                    .count(),
+                0,
+                "{duration:?}: the bare untap rider must not install under a \
+                 non-control host wording"
+            );
+        }
+
+        // Positive control: the bare untap-prevention rider under the CONTROL
+        // wording installs, carrying the control gate (not refused).
+        let mut state = GameState::new_two_player(42);
+        let bear = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Test Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let untap_rider = crate::types::ability::ReplacementDefinition::new(
+            crate::types::replacements::ReplacementEvent::Untap,
+        );
+        let mut install = ResolvedAbility::new(
+            Effect::AddTargetReplacement {
+                replacement: Box::new(untap_rider),
+                target: TargetFilter::Any,
+            },
+            vec![TargetRef::Object(bear)],
+            ObjectId(0),
+            PlayerId(0),
+        );
+        install.duration = Some(Duration::WhileControllingHost);
+        crate::game::effects::add_target_replacement::resolve(
+            &mut state,
+            &install,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let defs: Vec<_> = state.objects[&bear]
+            .replacement_definitions
+            .iter_all()
+            .collect();
+        assert_eq!(defs.len(), 1, "the bare untap rider must still install");
+        assert!(
+            matches!(
+                defs[0].condition,
+                Some(ReplacementCondition::ControllerControlsSource { .. })
+            ),
+            "…and it must carry the control gate, proving the refusal above is \
+             the gate check, not a blanket drop"
         );
     }
 }

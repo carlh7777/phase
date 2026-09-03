@@ -1,41 +1,14 @@
 import { strFromU8, unzipSync } from "fflate";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { GameState } from "../../adapter/types.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
+import { buildEngineAdapterMock } from "../../test/factories/engineAdapterFactory.ts";
+import { buildGameState } from "../../test/factories/gameStateFactory.ts";
 import {
   exportGameStateDebugZip,
+  exportAuthoritativeGameStateZip,
   serializeGameStateDebugSnapshot,
 } from "../gameStateExport.ts";
-
-function createGameState(overrides: Partial<GameState> = {}): GameState {
-  return {
-    turn_number: 7,
-    active_player: 0,
-    phase: "PreCombatMain",
-    players: [
-      { id: 0, life: 20, poison_counters: 0, mana_pool: { mana: [] }, library: [], hand: [], graveyard: [], has_drawn_this_turn: false, lands_played_this_turn: 0, turns_taken: 0 },
-      { id: 1, life: 20, poison_counters: 0, mana_pool: { mana: [] }, library: [], hand: [], graveyard: [], has_drawn_this_turn: false, lands_played_this_turn: 0, turns_taken: 0 },
-    ],
-    priority_player: 0,
-    objects: {},
-    next_object_id: 1,
-    battlefield: [],
-    stack: [],
-    exile: [],
-    rng_seed: 1,
-    combat: null,
-    waiting_for: { type: "Priority", data: { player: 0 } },
-    has_pending_cast: false,
-    lands_played_this_turn: 0,
-    max_lands_per_turn: 1,
-    priority_pass_count: 0,
-    pending_replacement: null,
-    layers_dirty: false,
-    next_timestamp: 1,
-    ...overrides,
-  } as GameState;
-}
 
 describe("gameStateExport", () => {
   afterEach(() => {
@@ -44,7 +17,7 @@ describe("gameStateExport", () => {
   });
 
   it("serializes the debug snapshot as minified JSON by default", () => {
-    const gameState = createGameState();
+    const gameState = buildGameState({ turn_number: 7 });
     useGameStore.setState({
       gameState,
       waitingFor: gameState.waiting_for,
@@ -64,7 +37,7 @@ describe("gameStateExport", () => {
   });
 
   it("writes a zip containing the minified JSON snapshot through the save picker", async () => {
-    const gameState = createGameState();
+    const gameState = buildGameState({ turn_number: 7 });
     let writtenBlob: Blob | null = null;
     const write = vi.fn(async (blob: Blob) => {
       writtenBlob = blob;
@@ -98,5 +71,60 @@ describe("gameStateExport", () => {
     expect(entryName).toMatch(/^game-state-turn-7-.*\.json$/);
     expect(json).not.toContain("\n");
     expect(JSON.parse(json).gameState.turn_number).toBe(7);
+  });
+
+  it("writes the trusted engine envelope, not the client snapshot", async () => {
+    const trustedState = JSON.stringify({
+      state: { stack_resolution_session: { policy: "RecheckNoMeaningfulPriorityAction" } },
+      schema_version: 1,
+    });
+    let writtenBlob: Blob | null = null;
+    const write = vi.fn(async (blob: Blob) => {
+      writtenBlob = blob;
+    });
+    Object.defineProperty(window, "showSaveFilePicker", {
+      configurable: true,
+      value: vi.fn(async () => ({
+        createWritable: async () => ({ write, close: vi.fn(async () => {}) }),
+      })),
+    });
+    const adapter = buildEngineAdapterMock(undefined, {
+      exportPersistenceState: vi.fn().mockResolvedValue(trustedState),
+    });
+    useGameStore.setState({ gameMode: "ai" });
+
+    const filename = await exportAuthoritativeGameStateZip(adapter);
+
+    expect(filename).toMatch(/^authoritative-game-state-.*\.zip$/);
+    expect(adapter.exportPersistenceState).toHaveBeenCalledOnce();
+    const entries = unzipSync(new Uint8Array(await writtenBlob!.arrayBuffer()));
+    const [entryName] = Object.keys(entries);
+    expect(entryName).toMatch(/^authoritative-game-state-.*\.json$/);
+    expect(strFromU8(entries[entryName])).toBe(trustedState);
+  });
+
+  it("exports the trusted envelope from the P2P host", async () => {
+    const trustedState = JSON.stringify({ state: { players: [{ hand: ["host-only-card"] }] } });
+    const adapter = buildEngineAdapterMock(undefined, {
+      exportPersistenceState: vi.fn().mockResolvedValue(trustedState),
+    });
+    useGameStore.setState({ gameMode: "p2p-host" });
+
+    await exportAuthoritativeGameStateZip(adapter);
+
+    expect(adapter.exportPersistenceState).toHaveBeenCalledOnce();
+  });
+
+  it("does not expose the trusted envelope from a P2P guest", async () => {
+    const exportPersistenceState = vi.fn().mockResolvedValue(JSON.stringify({
+      state: { players: [{ hand: ["hidden-card"] }] },
+    }));
+    const adapter = buildEngineAdapterMock(undefined, { exportPersistenceState });
+    useGameStore.setState({ gameMode: "p2p-join" });
+
+    await expect(exportAuthoritativeGameStateZip(adapter)).rejects.toThrow(
+      "Authoritative state export is unavailable for shared games",
+    );
+    expect(exportPersistenceState).not.toHaveBeenCalled();
   });
 });

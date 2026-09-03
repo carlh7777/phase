@@ -64,6 +64,7 @@ pub fn resolve(
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::GrantExtraLoyaltyActivations,
         source_id: ability.source_id,
+        subject: None,
     });
 
     Ok(())
@@ -72,12 +73,15 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{AbilityKind, QuantityExpr, SpellContext, SubAbilityLink};
+    use crate::types::ability::{
+        AbilityKind, QuantityExpr, SiblingCondition, SpellContext, SubAbilityLink,
+    };
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
 
     fn make_ability(amount: QuantityExpr, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility {
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::GrantExtraLoyaltyActivations {
                 amount,
                 target: TargetFilter::Controller,
@@ -87,7 +91,13 @@ mod tests {
             scoped_player: None,
             target_chooser: None,
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
+            trigger_source: None,
+            trigger_definition_ref: None,
+            force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            selected_target_incarnations: Vec::new(),
             targets: vec![],
             kind: AbilityKind::Activated,
             sub_ability: None,
@@ -97,32 +107,42 @@ mod tests {
             context: SpellContext::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
+            selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
+            noted_mana_payment: None,
+            cost_paid_object_ids: Vec::new(),
             effect_context_object: None,
+            amassed_army_object: None,
             ability_index: None,
             may_trigger_origin: None,
             repeat_for: None,
             min_x_value: 0,
+            announced_x: None,
             cant_be_copied: false,
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
             distribution: None,
+            distribute: None,
             target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,
             chosen_players: Vec::new(),
             repeat_until: None,
+            replacement_applied: Default::default(),
             sub_link: SubAbilityLink::ContinuationStep,
+            sibling_condition: SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
-            dig_found_nothing_for_parent_target: false,
+            parent_target_missing_reason: None,
         }
     }
 

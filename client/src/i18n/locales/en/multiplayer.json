@@ -1,8 +1,15 @@
 {
   "concedeDialog": {
     "title": "Concede Game?",
-    "message": "Your opponent will be declared the winner.",
-    "concede": "Concede"
+    "game": {
+      "label": "Concede this game",
+      "ordinaryMessage": "Your opponent wins this game.",
+      "matchMessage": "You concede only the current game. If the match is not decided, sideboarding or the next game follows."
+    },
+    "match": {
+      "label": "Concede entire match",
+      "message": "You concede the match. Your opponent wins the match and no further games will be played."
+    }
   },
   "takebackDialog": {
     "requestedTitle": "{{name}} requests a takeback",
@@ -53,16 +60,18 @@
     "matchScore": "Match score {{p0}}-{{p1}}{{draws}}. Move cards between main and sideboard, then submit.",
     "draws_one": " ({{count}} draw)",
     "draws_other": " ({{count}} draws)",
-    "main": "Main ({{count}}/{{total}})",
+    "main": "Main ({{count}}, min {{min}})",
     "sideboard": "Sideboard ({{count}})",
+    "sideboardCapped": "Sideboard ({{count}}/{{max}})",
     "moveFromSideboard": "Move cards from the sideboard.",
     "moveFromMain": "Move cards from the main deck.",
-    "matchesRegistered": "Main deck matches registered size ({{total}}).",
-    "submitDisabled": "Main deck is {{count}} / {{total}} — submit disabled.",
     "resetAria": "Reset to registered deck",
     "reset": "Reset",
     "submitAria": "Submit deck for next game",
-    "submitDeck": "Submit Deck"
+    "submitDeck": "Submit Deck",
+    "readyToSubmit": "Deck is legal — ready to submit.",
+    "belowMinimum": "Main deck needs at least {{min}} cards — {{count}} now.",
+    "overSideboardCap": "Sideboard holds {{count}} cards — maximum {{max}}."
   },
   "brokerOfflinePrompt": {
     "title": "Lobby server unreachable",
@@ -71,6 +80,12 @@
   },
   "joinErrorDialog": {
     "dismiss": "Dismiss"
+  },
+  "reconnectRejected": {
+    "firstMessageInvalid": "The host rejected the connection before setup. Refresh both windows and try again.",
+    "versionRequired": "This host requires wire protocol v{{version}}. Refresh both windows and try again.",
+    "versionMismatch": "Wire protocol mismatch: your client sent v{{guestVersion}}, but the host uses v{{hostVersion}}. Refresh both windows.",
+    "malformedAuthority": "The host rejected invalid connection authority. Rejoin using a new room code."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking unreachable",
@@ -110,6 +125,7 @@
     "subtitle": "Pick a region, or connect to a self-hosted instance.",
     "noneLabel": "None (P2P only)",
     "directCodes": "direct codes",
+    "official": "Official",
     "selfHosted": "Self-hosted",
     "customUrlPlaceholder": "wss://your-server.example/ws",
     "test": "Test",
@@ -204,7 +220,17 @@
     "back": "Back",
     "opening": "Opening…",
     "hostP2PGame": "Host P2P Game",
-    "hostGame": "Host Game"
+    "hostGame": "Host Game",
+    "savedFormats": "Saved Custom Formats",
+    "saveAsCustomFormat": "Save format",
+    "customFormatNamePlaceholder": "Name this format",
+    "useCustomFormat": "Use",
+    "customFormatInUse": "In use",
+    "deleteCustomFormat": "Delete",
+    "loadingCustomFormat": "Loading format…",
+    "noSavedCustomFormats": "No saved custom formats yet.",
+    "customFormatResolveFailed": "Could not load that saved format.",
+    "customFormatHostingUnavailable": "Hosting with a custom format isn't supported yet — deck legality can't be checked for it. Save and preview it for now."
   },
   "page": {
     "deckRejected": "Deck was rejected by the host.",

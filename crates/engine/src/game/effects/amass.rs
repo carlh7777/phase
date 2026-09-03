@@ -1,10 +1,12 @@
 use crate::game::effects::counters::{
-    add_counter_with_replacement, stash_pending_counter_completion_with_actions,
+    add_counter_with_replacement, stash_pending_counter_post_actions,
 };
 use crate::game::effects::token::apply_create_token_after_replacement;
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::replacement::{self, ReplacementResult};
-use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
+use crate::types::ability::{
+    CostPaidObjectSnapshot, Effect, EffectError, EffectKind, ResolvedAbility,
+};
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
@@ -36,55 +38,14 @@ pub fn resolve(
     // CR 701.47a: Find an existing Army creature on the controller's battlefield.
     let army_id = find_army(state, controller);
 
-    let target_id = if let Some(id) = army_id {
-        id
+    let Some(target_id) = (if let Some(id) = army_id {
+        Some(id)
     } else {
-        let Some(id) = create_army_token(state, controller, &subtype, ability, events) else {
-            return Ok(());
-        };
-        id
-    };
-
-    // CR 701.47a: Put N +1/+1 counters on the chosen Army.
-    if n > 0
-        && !add_counter_with_replacement(
-            state,
-            ability.controller,
-            target_id,
-            CounterType::Plus1Plus1,
-            n,
-            events,
-        )
-    {
-        stash_pending_counter_completion_with_actions(
-            state,
-            EffectKind::Amass,
-            ability.source_id,
-            vec![PendingCounterPostAction::AddSubtype {
-                object_id: target_id,
-                subtype: subtype.clone(),
-            }],
-        );
+        create_army_token(state, controller, &subtype, n, ability, events)
+    }) else {
         return Ok(());
-    }
-
-    // CR 701.47a: If it isn't a [subtype], it becomes a [subtype] in addition to its other types.
-    if let Some(obj) = state.objects.get_mut(&target_id) {
-        if !obj
-            .card_types
-            .subtypes
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(&subtype))
-        {
-            obj.card_types.subtypes.push(subtype.clone());
-            obj.base_card_types.subtypes.push(subtype);
-        }
-    }
-
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::Amass,
-        source_id: ability.source_id,
-    });
+    };
+    continue_amass_on_army(state, controller, target_id, &subtype, n, ability, events);
 
     Ok(())
 }
@@ -105,11 +66,124 @@ fn find_army(state: &GameState, controller: crate::types::player::PlayerId) -> O
         .min_by_key(|id| id.0) // deterministic: lowest ObjectId
 }
 
+pub(crate) fn continue_amass_after_token_creation(
+    state: &mut GameState,
+    controller: crate::types::player::PlayerId,
+    subtype: &str,
+    count: u32,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    let Some(object_id) = find_army(state, controller) else {
+        return true;
+    };
+    continue_amass_on_army(
+        state, controller, object_id, subtype, count, ability, events,
+    )
+}
+
+pub(crate) fn continue_amass_on_army(
+    state: &mut GameState,
+    controller: crate::types::player::PlayerId,
+    object_id: ObjectId,
+    subtype: &str,
+    count: u32,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    // CR 701.47a + CR 614.16: Counter replacement choices interrupt the amass
+    // instruction before subtype addition and CR 701.47c binding complete.
+    if count > 0
+        && !add_counter_with_replacement(
+            state,
+            controller,
+            object_id,
+            CounterType::Plus1Plus1,
+            count,
+            events,
+        )
+    {
+        stash_pending_counter_post_actions(
+            state,
+            EffectKind::Amass,
+            ability.source_id,
+            vec![PendingCounterPostAction::FinalizeAmass {
+                object_id,
+                subtype: subtype.to_string(),
+                ability: Box::new(ability.clone()),
+            }],
+        );
+        return false;
+    }
+
+    finalize_amass(state, object_id, subtype, ability, events);
+    true
+}
+
+pub(crate) fn finalize_amass(
+    state: &mut GameState,
+    object_id: ObjectId,
+    subtype: &str,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) {
+    // CR 701.47a: If the chosen Army isn't a [subtype], it becomes a [subtype]
+    // in addition to its other types.
+    if let Some(obj) = state.objects.get_mut(&object_id) {
+        if !obj
+            .card_types
+            .subtypes
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(subtype))
+        {
+            obj.card_types.subtypes.push(subtype.to_string());
+            obj.base_card_types.subtypes.push(subtype.to_string());
+        }
+    }
+
+    crate::game::layers::flush_layers(state);
+    let Some(snapshot) = amassed_army_snapshot(state, object_id) else {
+        return;
+    };
+
+    // CR 701.47c + CR 608.2c: Chained reflexive continuations may have been
+    // stashed before a replacement choice finished. Stamp them with the final
+    // post-replacement Army snapshot before they resume.
+    if let Some(frame) = state.active_ability_continuation_frame_mut() {
+        frame
+            .pending
+            .chain
+            .set_amassed_army_object_recursive(snapshot.clone());
+    }
+
+    events.push(GameEvent::ArmyAmassed {
+        object_id,
+        source_id: ability.source_id,
+        controller: ability.controller,
+    });
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::Amass,
+        source_id: ability.source_id,
+        subject: None,
+    });
+}
+
+fn amassed_army_snapshot(state: &GameState, object_id: ObjectId) -> Option<CostPaidObjectSnapshot> {
+    state
+        .objects
+        .get(&object_id)
+        .map(|obj| CostPaidObjectSnapshot {
+            object_id,
+            lki: obj.snapshot_public_characteristics(),
+        })
+}
+
 /// Create a 0/0 black [subtype] Army creature token on the battlefield.
 fn create_army_token(
     state: &mut GameState,
     controller: crate::types::player::PlayerId,
     subtype: &str,
+    count: u32,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Option<ObjectId> {
@@ -130,7 +204,7 @@ fn create_army_token(
         enter_with_counters: vec![],
         tapped: false,
         enters_attacking: false,
-        attach_to: None,
+        attach_to: crate::types::proposed_event::TokenHostRequest::NotRequested,
         sacrifice_at: None,
         source_id: ability.source_id,
         controller: ability.controller,
@@ -154,6 +228,17 @@ fn create_army_token(
         }
         ReplacementResult::Prevented => None,
         ReplacementResult::NeedsChoice(player) => {
+            stash_pending_counter_post_actions(
+                state,
+                EffectKind::Amass,
+                ability.source_id,
+                vec![PendingCounterPostAction::ContinueAmassAfterTokenCreation {
+                    controller,
+                    subtype: subtype.to_string(),
+                    count,
+                    ability: Box::new(ability.clone()),
+                }],
+            );
             state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
             None
         }
@@ -201,8 +286,8 @@ mod tests {
         assert_eq!(armies.len(), 1);
         let army = armies[0];
         assert!(army.is_token);
-        assert_eq!(army.power, Some(0));
-        assert_eq!(army.toughness, Some(0));
+        assert_eq!(army.power, Some(2));
+        assert_eq!(army.toughness, Some(2));
         assert!(army.card_types.subtypes.contains(&"Zombie".to_string()));
         assert!(army.card_types.subtypes.contains(&"Army".to_string()));
         assert_eq!(army.color, vec![ManaColor::Black]);
@@ -298,7 +383,7 @@ mod tests {
                 enter_with_counters: Vec::new(),
                 tapped: false,
                 enters_attacking: false,
-                attach_to: None,
+                attach_to: crate::types::proposed_event::TokenHostRequest::NotRequested,
                 sacrifice_at: None,
                 source_id: ObjectId(0),
                 controller: P0,
@@ -339,6 +424,137 @@ mod tests {
             squirrel_tokens.len(),
             1,
             "Chatterfang should append one Squirrel when amass creates the Army token"
+        );
+    }
+
+    // CR 701.47a + CR 701.47c + CR 301.5a (Goblin Plate Mail, HOB): the
+    // provenance-binding regression pair. "When this Equipment enters, amass
+    // Goblins 1, then attach this Equipment to the amassed Army" must attach
+    // to the EXACT Army object amass just touched — the freshly created
+    // token in the no-Army case, or the pre-existing Army in the other —
+    // never re-derived by rescanning the battlefield for "an Army you
+    // control" after the fact.
+    const GOBLIN_PLATE_MAIL_ORACLE: &str = "When this Equipment enters, amass Goblins 1, then \
+         attach this Equipment to the amassed Army. (To amass Goblins 1, put a +1/+1 counter on \
+         an Army you control. It's also a Goblin. If you don't control an Army, create a 0/0 \
+         black Goblin Army creature token first.)\nEquipped creature gets +1/+0 and has \
+         menace.\nEquip {4}";
+
+    /// CR 701.47a: no pre-existing Army — ETB creates a 0/0 black Goblin Army
+    /// token, amass puts one +1/+1 counter on it, and the Equipment ends up
+    /// attached to THAT token specifically. By the time resolution finishes,
+    /// the Equipment's own "equipped creature gets +1/+0" (CR 613.4c layer
+    /// 7c) is also live on its new host, so the token's EFFECTIVE power/
+    /// toughness is 2/1 (0/0 base + the counter's +1/+1 + the equipment's
+    /// +1/+0) — not the 1/1 the counter alone would produce.
+    #[test]
+    fn goblin_plate_mail_etb_creates_army_and_attaches_to_it() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let equipment = scenario
+            .add_artifact_to_hand_from_oracle(P0, "Goblin Plate Mail", GOBLIN_PLATE_MAIL_ORACLE)
+            .with_subtypes(vec!["Equipment"])
+            .with_mana_cost(crate::types::mana::ManaCost::generic(0))
+            .id();
+        let mut runner = scenario.build();
+
+        let outcome = runner.cast(equipment).resolve();
+        let state = outcome.state();
+
+        let armies: Vec<_> = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|obj| obj.card_types.subtypes.iter().any(|s| s == "Army"))
+            .collect();
+        assert_eq!(
+            armies.len(),
+            1,
+            "expected exactly one Army on the battlefield"
+        );
+        let army = armies[0];
+        assert!(
+            army.is_token,
+            "no pre-existing Army — amass must create a token"
+        );
+        assert_eq!(army.base_power, Some(0), "amass creates a 0/0 Army token");
+        assert_eq!(
+            army.base_toughness,
+            Some(0),
+            "amass creates a 0/0 Army token"
+        );
+        assert_eq!(
+            army.counters.get(&CounterType::Plus1Plus1).copied(),
+            Some(1),
+            "amass Goblins 1 puts one +1/+1 counter on the amassed Army"
+        );
+        // CR 613.4c (layer 7c): once attached, Goblin Plate Mail's own
+        // "equipped creature gets +1/+0" is live on this token too, so the
+        // EFFECTIVE power/toughness is base 0/0 + the counter's +1/+1 + the
+        // equipment's +1/+0 = 2/1, not the 1/1 the counter alone would give.
+        assert_eq!(army.power, Some(2));
+        assert_eq!(army.toughness, Some(1));
+        assert!(army.card_types.subtypes.iter().any(|s| s == "Goblin"));
+
+        let equipment_obj = state.objects.get(&equipment).expect("equipment object");
+        assert_eq!(
+            equipment_obj.attached_to,
+            Some(crate::game::game_object::AttachTarget::Object(army.id)),
+            "Goblin Plate Mail must attach to the newly created Army token"
+        );
+    }
+
+    /// CR 701.47c: a pre-existing Army — amass must reuse it (not create a
+    /// second, phantom Army) and the Equipment must attach to THAT exact
+    /// object, not to some Army found by re-scanning the battlefield.
+    #[test]
+    fn goblin_plate_mail_etb_reuses_existing_army_and_attaches_to_it() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(crate::types::phase::Phase::PreCombatMain);
+        let existing_army = scenario
+            .add_creature(P0, "Zombie Army", 0, 0)
+            .with_subtypes(vec!["Army", "Zombie"])
+            .id();
+        scenario.with_counter(existing_army, CounterType::Plus1Plus1, 2);
+        let equipment = scenario
+            .add_artifact_to_hand_from_oracle(P0, "Goblin Plate Mail", GOBLIN_PLATE_MAIL_ORACLE)
+            .with_subtypes(vec!["Equipment"])
+            .with_mana_cost(crate::types::mana::ManaCost::generic(0))
+            .id();
+        let mut runner = scenario.build();
+
+        let outcome = runner.cast(equipment).resolve();
+        let state = outcome.state();
+
+        let armies: Vec<_> = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|obj| obj.card_types.subtypes.iter().any(|s| s == "Army"))
+            .collect();
+        assert_eq!(
+            armies.len(),
+            1,
+            "must not create a second Army when the controller already has one"
+        );
+        let army = armies[0];
+        assert_eq!(
+            army.id, existing_army,
+            "must reuse the pre-existing Army object, not a new one"
+        );
+        assert_eq!(
+            army.counters.get(&CounterType::Plus1Plus1).copied(),
+            Some(3),
+            "amass Goblins 1 adds to the existing Army's counters (2 -> 3)"
+        );
+        assert!(army.card_types.subtypes.iter().any(|s| s == "Zombie"));
+        assert!(army.card_types.subtypes.iter().any(|s| s == "Goblin"));
+
+        let equipment_obj = state.objects.get(&equipment).expect("equipment object");
+        assert_eq!(
+            equipment_obj.attached_to,
+            Some(crate::game::game_object::AttachTarget::Object(existing_army)),
+            "Goblin Plate Mail must attach to the EXISTING Army amass touched, not a phantom new one"
         );
     }
 }

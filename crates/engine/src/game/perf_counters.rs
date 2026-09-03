@@ -3,7 +3,21 @@ use std::cell::Cell;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PerfCounterSnapshot {
     pub state_clone_for_legality: u64,
+    pub generation_state_clones: u64,
+    pub strict_fast_path_state_clones: u64,
+    pub strict_fast_path_mana_readiness_state_clones: u64,
+    pub raw_validation_state_clones: u64,
+    pub grouped_mana_readiness_state_clones: u64,
+    pub post_apply_auto_payment_core_state_clones: u64,
+    pub priority_cast_probe_state_clones: u64,
+    pub auto_payment_borrowed_wrapper_calls: u64,
+    pub auto_payment_owned_state_clones: u64,
+    pub generation_auto_payment_wrapper_calls: u64,
+    pub strict_fast_path_auto_payment_wrapper_calls: u64,
+    pub post_apply_auto_payment_core_calls: u64,
+    pub post_apply_uncached_source_collections: u64,
     pub static_full_scans: u64,
+    pub spell_keyword_grant_scans: u64,
     pub layers_full_eval: u64,
     pub layers_incremental: u64,
     pub layers_escalated: u64,
@@ -16,11 +30,43 @@ pub struct PerfCounterSnapshot {
     pub stack_inert_noop_batches: u64,
     pub stack_inert_noop_entries: u64,
     pub legal_actions_spell_cost_sweeps: u64,
+    pub priority_cast_probe_builds: u64,
+    pub auto_tap_source_cache_builds: u64,
+    pub cached_auto_tap_source_reuses: u64,
+    pub cached_auto_tap_source_rejects: u64,
     pub mana_aura_trigger_scans: u64,
     pub crew_eligibility_scans: u64,
     pub attackable_player_sweeps: u64,
     pub combat_shadow_block_scans: u64,
     pub granted_ability_provider_scans: u64,
+    pub restriction_static_exact_scans: u64,
+    pub restriction_static_mode_gate_scans: u64,
+    pub legend_rule_mode_gate_scans: u64,
+    pub sba_battlefield_snapshot_builds: u64,
+    pub sba_empty_battlefield_short_circuits: u64,
+}
+
+/// Test-only cache-use counters for the homogeneous target-selection walk.
+///
+/// Kept separate from [`PerfCounterSnapshot`], whose serialized field set powers
+/// the AI performance baseline rather than integration-test instrumentation.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HomogeneousTargetWalkCacheCounters {
+    pub initializations: u64,
+    pub advances: u64,
+}
+
+/// Test-only counters for the prior-target-binding seams (cross-slot
+/// object-relative target binding, e.g. Puca's Mischief / Spawnbroker /
+/// Daring Thief). Kept out of [`PerfCounterSnapshot`] for the same reason the
+/// homogeneous-walk counters are: that struct's serialized field set powers
+/// the AI performance baseline.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PriorTargetBindingCounters {
+    pub static_union_enumerations: u64,
+    pub selection_bindings: u64,
 }
 
 thread_local! {
@@ -37,7 +83,21 @@ thread_local! {
     /// `AtomicU64`: that reintroduces the parallel-test flakiness this replaces.
     static COUNTERS: Cell<PerfCounterSnapshot> = const { Cell::new(PerfCounterSnapshot {
         state_clone_for_legality: 0,
+        generation_state_clones: 0,
+        strict_fast_path_state_clones: 0,
+        strict_fast_path_mana_readiness_state_clones: 0,
+        raw_validation_state_clones: 0,
+        grouped_mana_readiness_state_clones: 0,
+        post_apply_auto_payment_core_state_clones: 0,
+        priority_cast_probe_state_clones: 0,
+        auto_payment_borrowed_wrapper_calls: 0,
+        auto_payment_owned_state_clones: 0,
+        generation_auto_payment_wrapper_calls: 0,
+        strict_fast_path_auto_payment_wrapper_calls: 0,
+        post_apply_auto_payment_core_calls: 0,
+        post_apply_uncached_source_collections: 0,
         static_full_scans: 0,
+        spell_keyword_grant_scans: 0,
         layers_full_eval: 0,
         layers_incremental: 0,
         layers_escalated: 0,
@@ -50,12 +110,62 @@ thread_local! {
         stack_inert_noop_batches: 0,
         stack_inert_noop_entries: 0,
         legal_actions_spell_cost_sweeps: 0,
+        priority_cast_probe_builds: 0,
+        auto_tap_source_cache_builds: 0,
+        cached_auto_tap_source_reuses: 0,
+        cached_auto_tap_source_rejects: 0,
         mana_aura_trigger_scans: 0,
         crew_eligibility_scans: 0,
         attackable_player_sweeps: 0,
         combat_shadow_block_scans: 0,
         granted_ability_provider_scans: 0,
+        restriction_static_exact_scans: 0,
+        restriction_static_mode_gate_scans: 0,
+        legend_rule_mode_gate_scans: 0,
+        sba_battlefield_snapshot_builds: 0,
+        sba_empty_battlefield_short_circuits: 0,
     }) };
+    #[cfg(feature = "test-support")]
+    static HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS: Cell<HomogeneousTargetWalkCacheCounters> = const {
+        Cell::new(HomogeneousTargetWalkCacheCounters {
+            initializations: 0,
+            advances: 0,
+        })
+    };
+    #[cfg(feature = "test-support")]
+    static PRIOR_TARGET_BINDING_COUNTERS: Cell<PriorTargetBindingCounters> = const {
+        Cell::new(PriorTargetBindingCounters {
+            static_union_enumerations: 0,
+            selection_bindings: 0,
+        })
+    };
+    static LEGALITY_CLONE_PHASE: Cell<Option<LegalityClonePhase>> = const { Cell::new(None) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegalityClonePhase {
+    Generation,
+    StrictFastPath,
+    RawValidation,
+    GroupedManaReadiness,
+    PostApplyCore,
+}
+
+pub(crate) struct LegalityClonePhaseGuard {
+    previous: Option<LegalityClonePhase>,
+}
+
+impl LegalityClonePhaseGuard {
+    pub(crate) fn enter(phase: LegalityClonePhase) -> Self {
+        let previous = LEGALITY_CLONE_PHASE.with(|current| current.replace(Some(phase)));
+        Self { previous }
+    }
+}
+
+impl Drop for LegalityClonePhaseGuard {
+    fn drop(&mut self) {
+        LEGALITY_CLONE_PHASE.with(|current| current.set(self.previous));
+    }
 }
 
 fn with_mut(f: impl FnOnce(&mut PerfCounterSnapshot)) {
@@ -70,12 +180,138 @@ pub fn record_state_clone_for_legality() {
     with_mut(|s| s.state_clone_for_legality += 1);
 }
 
+#[cfg(feature = "test-support")]
+pub fn record_homogeneous_target_walk_cache_initialization() {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.initializations += 1;
+        cell.set(counters);
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub fn record_homogeneous_target_walk_cache_advance() {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.advances += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2c + CR 603.3d: recorded once per candidate of the prior object slot
+/// unioned at static slot-build time (`union_over_prior_object_candidates`).
+#[cfg(feature = "test-support")]
+pub fn record_prior_target_binding_static_union_enumeration() {
+    PRIOR_TARGET_BINDING_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.static_union_enumerations += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 601.2c + CR 603.3d: recorded once per selection-time bind
+/// (`bind_prior_object_targets` returning `Some`) inside
+/// `legal_targets_for_selected_slot`.
+#[cfg(feature = "test-support")]
+pub fn record_prior_target_binding_selection() {
+    PRIOR_TARGET_BINDING_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.selection_bindings += 1;
+        cell.set(counters);
+    });
+}
+
+fn record_phase_owned_state_clone_for(
+    snapshot: &mut PerfCounterSnapshot,
+    phase: Option<LegalityClonePhase>,
+) {
+    match phase {
+        Some(LegalityClonePhase::Generation) => snapshot.generation_state_clones += 1,
+        Some(LegalityClonePhase::StrictFastPath) => snapshot.strict_fast_path_state_clones += 1,
+        Some(LegalityClonePhase::RawValidation) => snapshot.raw_validation_state_clones += 1,
+        Some(LegalityClonePhase::GroupedManaReadiness) => {
+            snapshot.grouped_mana_readiness_state_clones += 1;
+        }
+        Some(LegalityClonePhase::PostApplyCore) => {
+            snapshot.post_apply_auto_payment_core_state_clones += 1;
+        }
+        None => {}
+    }
+}
+
+pub(crate) fn record_phase_owned_state_clone() {
+    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
+    with_mut(|snapshot| record_phase_owned_state_clone_for(snapshot, phase));
+}
+
+pub(crate) fn record_mana_readiness_state_clone() {
+    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
+    with_mut(|snapshot| {
+        record_phase_owned_state_clone_for(snapshot, phase);
+        if phase == Some(LegalityClonePhase::StrictFastPath) {
+            snapshot.strict_fast_path_mana_readiness_state_clones += 1;
+        }
+    });
+}
+
+pub(crate) fn record_auto_payment_borrowed_wrapper() {
+    let phase = LEGALITY_CLONE_PHASE.with(Cell::get);
+    with_mut(|s| {
+        s.auto_payment_borrowed_wrapper_calls += 1;
+        s.auto_payment_owned_state_clones += 1;
+        match phase {
+            Some(LegalityClonePhase::Generation) => {
+                s.generation_auto_payment_wrapper_calls += 1;
+            }
+            Some(LegalityClonePhase::StrictFastPath) => {
+                s.strict_fast_path_auto_payment_wrapper_calls += 1;
+            }
+            Some(
+                LegalityClonePhase::RawValidation
+                | LegalityClonePhase::GroupedManaReadiness
+                | LegalityClonePhase::PostApplyCore,
+            )
+            | None => {}
+        }
+    });
+    record_phase_owned_state_clone();
+}
+
+pub(crate) fn record_priority_cast_probe_state_clone() {
+    with_mut(|s| s.priority_cast_probe_state_clones += 1);
+}
+
+pub(crate) fn record_post_apply_auto_payment_core_call() {
+    if LEGALITY_CLONE_PHASE.with(Cell::get) == Some(LegalityClonePhase::PostApplyCore) {
+        with_mut(|s| s.post_apply_auto_payment_core_calls += 1);
+    }
+}
+
+pub(crate) fn record_post_apply_uncached_source_collection() {
+    if LEGALITY_CLONE_PHASE.with(Cell::get) == Some(LegalityClonePhase::PostApplyCore) {
+        with_mut(|s| s.post_apply_uncached_source_collections += 1);
+    }
+}
+
 /// Counts every whole-battlefield / command-zone static sweep done for legality
 /// (each `check_static_ability` call). Combat/untap legality loops hoist a
 /// once-computed existence gate to drive this toward zero, collapsing O(N^2)
 /// per-loop scans to O(N).
+///
+/// Also incremented at the two hexproof scan gates in `static_abilities`
+/// (`player_ignores_hexproof`, `target_ignores_hexproof`), which each guard their
+/// O(battlefield) `.any()` behind the O(1) `static_kind_present(IgnoreHexproof)`
+/// presence index — so on a board with zero functioning `IgnoreHexproof` statics this
+/// counter stays at 0 across an entire target enumeration.
 pub fn record_static_full_scan() {
     with_mut(|s| s.static_full_scans += 1);
+}
+
+/// Counts full `game_active_statics` scans for `CastWithKeyword` spell grants.
+/// The O(1) `static_kind_present(CastWithKeyword)` gate should keep this at zero
+/// during candidate generation when no functioning spell-keyword grant exists.
+pub fn record_spell_keyword_grant_scan() {
+    with_mut(|s| s.spell_keyword_grant_scans += 1);
 }
 
 /// Counts every full-body execution of `blocker_can_block_shadow` (each a
@@ -94,6 +330,38 @@ pub fn record_combat_shadow_block_scan() {
 /// O(controllers×objects).
 pub fn record_granted_ability_provider_scan() {
     with_mut(|s| s.granted_ability_provider_scans += 1);
+}
+
+/// Counts the two exact restriction scans that walk
+/// `battlefield_active_statics`: activation-limit modifiers and
+/// activate-as-instant permissions. Their callers gate by mode first, so absent
+/// modes should leave this at zero.
+pub fn record_restriction_static_exact_scan() {
+    with_mut(|s| s.restriction_static_exact_scans += 1);
+}
+
+/// Counts once-computed activation-restriction mode gates. Board-wide legal
+/// action production should compute this once and thread it through every
+/// candidate; direct activation legality computes it locally for the one call.
+pub fn record_restriction_static_mode_gate_scan() {
+    with_mut(|s| s.restriction_static_mode_gate_scans += 1);
+}
+
+/// Counts legend-rule mode gate computations. The SBA legend-rule pass should
+/// compute this once before testing every legendary permanent.
+pub fn record_legend_rule_mode_gate_scan() {
+    with_mut(|s| s.legend_rule_mode_gate_scans += 1);
+}
+
+/// Counts one shared battlefield snapshot built for each SBA fixpoint iteration.
+pub fn record_sba_battlefield_snapshot_build() {
+    with_mut(|s| s.sba_battlefield_snapshot_builds += 1);
+}
+
+/// Counts SBA fixpoint iterations where an empty battlefield lets battlefield-only
+/// SBAs short-circuit while nonbattlefield SBAs still run.
+pub fn record_sba_empty_battlefield_short_circuit() {
+    with_mut(|s| s.sba_empty_battlefield_short_circuits += 1);
 }
 
 pub fn record_layers_full_eval() {
@@ -142,6 +410,22 @@ pub fn record_legal_actions_spell_cost_sweep() {
     with_mut(|s| s.legal_actions_spell_cost_sweeps += 1);
 }
 
+pub fn record_priority_cast_probe_build() {
+    with_mut(|s| s.priority_cast_probe_builds += 1);
+}
+
+pub fn record_auto_tap_source_cache_build() {
+    with_mut(|s| s.auto_tap_source_cache_builds += 1);
+}
+
+pub fn record_cached_auto_tap_source_reuse() {
+    with_mut(|s| s.cached_auto_tap_source_reuses += 1);
+}
+
+pub fn record_cached_auto_tap_source_reject() {
+    with_mut(|s| s.cached_auto_tap_source_rejects += 1);
+}
+
 pub fn record_mana_aura_trigger_scan() {
     with_mut(|s| s.mana_aura_trigger_scans += 1);
 }
@@ -158,6 +442,27 @@ pub fn snapshot() -> PerfCounterSnapshot {
     COUNTERS.with(|c| c.get())
 }
 
+#[cfg(feature = "test-support")]
+pub fn homogeneous_target_walk_cache_snapshot() -> HomogeneousTargetWalkCacheCounters {
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS.with(Cell::get)
+}
+
+#[cfg(feature = "test-support")]
+pub fn prior_target_binding_snapshot() -> PriorTargetBindingCounters {
+    PRIOR_TARGET_BINDING_COUNTERS.with(Cell::get)
+}
+
+#[cfg(feature = "test-support")]
+pub fn reset_prior_target_binding_counters() {
+    PRIOR_TARGET_BINDING_COUNTERS
+        .with(|counters| counters.set(PriorTargetBindingCounters::default()));
+}
+
 pub fn reset() {
     COUNTERS.with(|c| c.set(PerfCounterSnapshot::default()));
+    #[cfg(feature = "test-support")]
+    HOMOGENEOUS_TARGET_WALK_CACHE_COUNTERS
+        .with(|counters| counters.set(HomogeneousTargetWalkCacheCounters::default()));
+    #[cfg(feature = "test-support")]
+    reset_prior_target_binding_counters();
 }

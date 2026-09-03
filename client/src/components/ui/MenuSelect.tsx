@@ -2,6 +2,8 @@ import type { CSSProperties } from "react";
 import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
+import { useFocusScopePortalBranch } from "./FocusScope";
+
 const MENU_GAP_PX = 4;
 const MENU_VIEWPORT_PADDING_PX = 8;
 const MENU_MAX_HEIGHT_PX = 280;
@@ -225,6 +227,7 @@ export function MenuSelect({
   const [filterText, setFilterText] = useState("");
   const [minWidthPx, setMinWidthPx] = useState<number | undefined>(undefined);
   const triggerRef = useRef<HTMLButtonElement>(null);
+  const portalOwnerRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const measureRef = useRef<HTMLSpanElement>(null);
   const filterInputRef = useRef<HTMLInputElement>(null);
@@ -312,6 +315,14 @@ export function MenuSelect({
     setOpen(true);
   }, [closeMenu, disabled, open, useBottomSheet]);
 
+  useFocusScopePortalBranch({
+    active: open,
+    containerRef: menuRef,
+    ownerRef: portalOwnerRef,
+    anchorRef: triggerRef,
+    onDismiss: closeMenu,
+  });
+
   useLayoutEffect(() => {
     if (!open) return;
     updatePosition();
@@ -341,6 +352,7 @@ export function MenuSelect({
       closeMenu();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.isComposing || event.keyCode === 229) return;
       if (event.key === "Escape") {
         closeMenu();
         triggerRef.current?.focus();
@@ -414,8 +426,8 @@ export function MenuSelect({
   );
 
   const triggerClassName = [
-    "flex w-full items-center justify-between gap-2 rounded-xl border border-white/10 bg-black/18 px-3 py-1.5 text-left text-sm text-white transition-colors",
-    "hover:bg-white/6 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20",
+    "flex w-full items-center justify-between gap-2 rounded-[8px] border border-white/10 bg-slate-950/82 px-3 py-1.5 text-left text-sm text-white transition-colors",
+    "hover:bg-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/20",
     disabled ? "cursor-not-allowed opacity-40" : "",
     className,
   ]
@@ -452,7 +464,7 @@ export function MenuSelect({
 
       {open &&
         createPortal(
-          <>
+          <div ref={portalOwnerRef} className="contents">
             {useBottomSheet && (
               <button
                 type="button"
@@ -467,10 +479,10 @@ export function MenuSelect({
               role="listbox"
               aria-label={ariaLabel ?? label}
               className={[
-                `fixed ${menuZClassName} flex flex-col overflow-x-hidden overflow-y-auto overscroll-contain border border-white/10 bg-[#0a0f1b]/98 py-1 shadow-xl backdrop-blur-md thin-scrollbar`,
+                `fixed ${menuZClassName} flex flex-col overflow-x-hidden overflow-y-auto overscroll-contain border border-white/10 bg-[#0a0f1b] py-1 shadow-xl thin-scrollbar`,
                 useBottomSheet
-                  ? "inset-x-0 bottom-[calc(76px+env(safe-area-inset-bottom))] max-h-[min(70dvh,calc(100dvh-76px-env(safe-area-inset-bottom)-1rem))] rounded-t-2xl rounded-b-none border-b-0"
-                  : "rounded-xl",
+                  ? "inset-x-2 bottom-[calc(76px+env(safe-area-inset-bottom))] max-h-[min(70dvh,calc(100dvh-76px-env(safe-area-inset-bottom)-1rem))] rounded-[10px]"
+                  : "rounded-[8px]",
                 menuClassName,
               ].join(" ")}
               onWheel={(event) => event.stopPropagation()}
@@ -518,7 +530,7 @@ export function MenuSelect({
                 </div>
               )}
             </div>
-          </>,
+          </div>,
           document.body,
         )}
     </div>

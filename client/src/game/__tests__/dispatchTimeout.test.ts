@@ -1,9 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { EngineAdapter, GameAction, GameState, LegalActionsResult, SubmitResult } from "../../adapter/types";
-import { AdapterError, AdapterErrorCode } from "../../adapter/types";
+import type { ActionRejection, EngineAdapter, GameAction, SubmitResult } from "../../adapter/types";
+import { actionRejectionError, AdapterError, AdapterErrorCode, nextSnapshotSeq } from "../../adapter/types";
+import { useAppNotificationStore } from "../../stores/appToastStore";
 import { useGameStore } from "../../stores/gameStore";
-import { dispatchAction } from "../dispatch";
+import { buildEngineAdapterMock } from "../../test/factories/engineAdapterFactory";
+import {
+  buildGameState,
+  buildLegalActionsResult,
+  buildPlayer,
+  buildPriorityWaitingFor,
+} from "../../test/factories/gameStateFactory";
+import { dispatchAction, dispatchInteraction } from "../dispatch";
 
 // Spy on the recovery escalation so we can assert the dispatch.ts branch that
 // fires `notifyEngineLost` on ENGINE_UNRESPONSIVE actually runs. Without this
@@ -21,11 +29,20 @@ vi.mock("../engineRecovery", () => ({
 }));
 
 /** Minimal stack-empty state — enough for dispatch's pre-call bookkeeping. */
-const emptyState = {
+const emptyState = buildGameState({
   stack: [],
-  waiting_for: null,
   players: [],
-} as unknown as GameState;
+});
+
+function rejection(overrides: Partial<ActionRejection> = {}): ActionRejection {
+  return {
+    code: "invalid_action",
+    disposition: "invalid",
+    message: "Engine error: ObjectId(200) must be blocked by 2 or more creatures",
+    related_object_ids: [200],
+    ...overrides,
+  };
+}
 
 /**
  * Regression for the silent-freeze bug: when a gameplay worker round-trip
@@ -40,11 +57,13 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     notifyEngineLost.mockClear();
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
   });
 
   beforeEach(() => {
     vi.restoreAllMocks();
     notifyEngineLost.mockClear();
+    useAppNotificationStore.setState({ notification: null, expiresAt: 0 });
   });
 
   it("surfaces recovery and releases the dispatch mutex so a later dispatch is not silently dropped", async () => {
@@ -55,7 +74,7 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
       );
 
     useGameStore.setState({
-      adapter: { submitAction } as unknown as EngineAdapter,
+      adapter: buildEngineAdapterMock(emptyState, { submitAction }),
       gameState: emptyState,
       gameMode: "ai",
     });
@@ -73,6 +92,7 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
     // and the error is merely rethrown — this assertion then fails even though
     // the mutex still resets.
     expect(notifyEngineLost).toHaveBeenCalledWith("submitAction-timeout");
+    expect(useAppNotificationStore.getState().notification).toBeNull();
 
     // The mutex must be free: a second, distinct dispatch reaches submitAction
     // again rather than being queued behind a stuck `isAnimating`. (A held
@@ -84,19 +104,158 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
     expect(submitAction).toHaveBeenCalledTimes(2);
   });
 
+  it("shows a clear toast when a normal game action fails", async () => {
+    const submitAction = vi
+      .fn<EngineAdapter["submitAction"]>()
+      .mockRejectedValue(new Error("Engine error: Action not allowed: Cannot pay mana cost"));
+
+    useGameStore.setState({
+      adapter: buildEngineAdapterMock(emptyState, { submitAction }),
+      gameState: emptyState,
+      gameMode: "ai",
+    });
+
+    await expect(dispatchAction({ type: "ChooseTarget", data: { target: null } }, 0)).rejects.toThrow(
+      "Cannot pay mana cost",
+    );
+
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Skip target failed",
+      description: "Engine error: Action not allowed: Cannot pay mana cost",
+    });
+  });
+
+  it("anchors a structured rejection at the first rendered related object without changing its message", async () => {
+    const first = document.createElement("div");
+    first.dataset.objectId = "200";
+    first.getBoundingClientRect = () => ({
+      x: 10, y: 30, top: 30, right: 50, bottom: 70, left: 10, width: 40, height: 40,
+      toJSON: () => ({}),
+    });
+    const second = document.createElement("div");
+    second.dataset.objectId = "201";
+    document.body.append(first, second);
+    const engineRejection = rejection({ related_object_ids: [200, 201] });
+    const submitAction = vi
+      .fn<EngineAdapter["submitAction"]>()
+      .mockRejectedValue(actionRejectionError(engineRejection));
+
+    useGameStore.setState({
+      adapter: buildEngineAdapterMock(emptyState, { submitAction }),
+      gameState: emptyState,
+      gameMode: "ai",
+    });
+
+    await expect(dispatchAction({ type: "ChooseTarget", data: { target: null } }, 0)).rejects.toBeInstanceOf(AdapterError);
+
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Skip target failed",
+      description: engineRejection.message,
+      anchor: { x: 192, y: 82, placement: "below" },
+    });
+    first.remove();
+    second.remove();
+  });
+
+  it("silently absorbs a stale structured rejection", async () => {
+    const submitAction = vi
+      .fn<EngineAdapter["submitAction"]>()
+      .mockRejectedValue(actionRejectionError(rejection({
+        code: "stale_action",
+        disposition: "stale",
+        message: "The action is no longer current",
+      })));
+
+    useGameStore.setState({
+      adapter: buildEngineAdapterMock(emptyState, { submitAction }),
+      gameState: emptyState,
+      gameMode: "ai",
+    });
+
+    await expect(dispatchAction({ type: "PassPriority", data: {} } as GameAction, 0)).resolves.toBeUndefined();
+    expect(useAppNotificationStore.getState().notification).toBeNull();
+  });
+
+  it("reports structured interaction rejections through the same contextual path", async () => {
+    const anchor = document.createElement("div");
+    anchor.dataset.groupedIds = "201 202";
+    anchor.getBoundingClientRect = () => ({
+      x: 40, y: 80, top: 80, right: 140, bottom: 120, left: 40, width: 100, height: 40,
+      toJSON: () => ({}),
+    });
+    document.body.append(anchor);
+    const engineRejection = rejection({ related_object_ids: [202] });
+    const submitInteraction = vi
+      .fn<NonNullable<EngineAdapter["submitInteraction"]>>()
+      .mockRejectedValue(actionRejectionError(engineRejection));
+
+    useGameStore.setState({
+      adapter: buildEngineAdapterMock(emptyState, { submitInteraction }),
+      gameState: emptyState,
+      gameMode: "ai",
+    });
+
+    await expect(dispatchInteraction({} as never, 0)).rejects.toBeInstanceOf(AdapterError);
+
+    expect(useAppNotificationStore.getState().notification).toEqual({
+      title: "Action failed",
+      description: engineRejection.message,
+      anchor: { x: 192, y: 132, placement: "below" },
+    });
+    anchor.remove();
+  });
+
+  it("reports a queued structured rejection once it reaches the dispatch pipeline", async () => {
+    const engineRejection = rejection({ related_object_ids: [] });
+    let resolveFirst!: (result: SubmitResult) => void;
+    const submitAction = vi
+      .fn<EngineAdapter["submitAction"]>()
+      .mockImplementationOnce(() => new Promise<SubmitResult>((resolve) => {
+        resolveFirst = resolve;
+      }))
+      .mockRejectedValueOnce(actionRejectionError(engineRejection));
+    const getSnapshot = vi.fn<EngineAdapter["getSnapshot"]>().mockResolvedValue({
+      state: emptyState,
+      legalResult: buildLegalActionsResult({ actions: [{ type: "ChooseTarget", data: { target: null } }] }),
+      seq: nextSnapshotSeq(),
+    });
+
+    useGameStore.setState({
+      adapter: buildEngineAdapterMock(emptyState, { submitAction, getSnapshot }),
+      gameState: emptyState,
+      waitingFor: emptyState.waiting_for,
+      legalActions: [{ type: "ChooseTarget", data: { target: null } }],
+      gameMode: "ai",
+    });
+
+    const first = dispatchAction({ type: "PassPriority", data: {} } as GameAction, 0);
+    const queued = dispatchAction({ type: "ChooseTarget", data: { target: null } }, 0);
+    resolveFirst({ events: [], log_entries: [] } as SubmitResult);
+
+    await expect(first).resolves.toBeUndefined();
+    await expect(queued).rejects.toBeInstanceOf(AdapterError);
+    expect(useAppNotificationStore.getState().notification).toMatchObject({
+      title: "Skip target failed",
+      description: engineRejection.message,
+    });
+  });
+
   it("does not fire recovery on a normal successful dispatch", async () => {
     const submitAction = vi
       .fn<EngineAdapter["submitAction"]>()
       .mockResolvedValue({ events: [], log_entries: [] } as unknown as SubmitResult);
-    const getState = vi
-      .fn<EngineAdapter["getState"]>()
-      .mockResolvedValue(emptyState);
-    const getLegalActions = vi
-      .fn<EngineAdapter["getLegalActions"]>()
-      .mockResolvedValue({ actions: [], autoPassRecommended: false } as unknown as LegalActionsResult);
+    // `processAction` reads the engine pair through `getSnapshot` only — the
+    // old getState + post-animation getLegalActions pair is gone.
+    const getSnapshot = vi
+      .fn<EngineAdapter["getSnapshot"]>()
+      .mockImplementation(async () => ({
+        state: emptyState,
+        legalResult: buildLegalActionsResult(),
+        seq: nextSnapshotSeq(),
+      }));
 
     useGameStore.setState({
-      adapter: { submitAction, getState, getLegalActions } as unknown as EngineAdapter,
+      adapter: buildEngineAdapterMock(emptyState, { submitAction, getSnapshot }),
       gameState: emptyState,
       gameMode: "ai",
     });
@@ -107,22 +266,24 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
 
     // The healthy path must never surface the engine-lost recovery prompt.
     expect(notifyEngineLost).not.toHaveBeenCalled();
+    // Exactly one engine pair read per dispatch — the split-epoch second fetch
+    // is gone, so a regression that reintroduces it shows up here.
+    expect(getSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it("drops a queued local action when the waiting prompt changes before it runs", async () => {
-    const firstWaitingFor = { type: "Priority", data: { player: 0 } };
-    const nextWaitingFor = { type: "Priority", data: { player: 1 } };
-    const initialState = {
-      ...emptyState,
+    const firstWaitingFor = buildPriorityWaitingFor();
+    const nextWaitingFor = buildPriorityWaitingFor({ data: { player: 1 } });
+    const initialState = buildGameState({
       waiting_for: firstWaitingFor,
-      players: [{ id: 0 }, { id: 1 }],
-      objects: { 1: { id: 1 } },
-    } as unknown as GameState;
-    const nextState = {
+      players: [buildPlayer({ id: 0 }), buildPlayer({ id: 1 })],
+      objects: {},
+    });
+    const nextState = buildGameState({
       ...initialState,
       waiting_for: nextWaitingFor,
       priority_player: 1,
-    } as unknown as GameState;
+    });
     let releaseFirst!: () => void;
     const submitAction = vi
       .fn<EngineAdapter["submitAction"]>()
@@ -133,20 +294,20 @@ describe("dispatchAction recovery on ENGINE_UNRESPONSIVE", () => {
           }),
       )
       .mockResolvedValue({ events: [], log_entries: [] } as unknown as SubmitResult);
-    const getState = vi
-      .fn<EngineAdapter["getState"]>()
-      .mockResolvedValue(nextState);
-    const getLegalActions = vi
-      .fn<EngineAdapter["getLegalActions"]>()
-      .mockResolvedValue({
-        actions: [{ type: "SelectCards", data: { cards: [] } }],
-        autoPassRecommended: false,
-      } as unknown as LegalActionsResult);
+    const getSnapshot = vi
+      .fn<EngineAdapter["getSnapshot"]>()
+      .mockImplementation(async () => ({
+        state: nextState,
+        legalResult: buildLegalActionsResult({
+          actions: [{ type: "SelectCards", data: { cards: [] } }],
+        }),
+        seq: nextSnapshotSeq(),
+      }));
 
     useGameStore.setState({
-      adapter: { submitAction, getState, getLegalActions } as unknown as EngineAdapter,
+      adapter: buildEngineAdapterMock(initialState, { submitAction, getSnapshot }),
       gameState: initialState,
-      waitingFor: firstWaitingFor as unknown as GameState["waiting_for"],
+      waitingFor: firstWaitingFor,
       gameMode: "ai",
     });
 

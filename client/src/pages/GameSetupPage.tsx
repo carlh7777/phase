@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate, useSearchParams } from "react-router";
 
@@ -10,23 +10,32 @@ import {
   SETUP_FORMATS,
 } from "../data/formatRegistry";
 import { useAudioContext } from "../audio/useAudioContext";
+import { loopDetectionModeToQuery } from "../game/loopDetectionMode";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
 import { AiOpponentConfig } from "../components/menu/AiOpponentConfig";
 import { FormatPicker } from "../components/menu/FormatPicker";
 import { MenuParticles } from "../components/menu/MenuParticles";
 import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
 import { MyDecks, StatusBadge } from "../components/menu/MyDecks";
+import { IntegerField } from "../components/ui/IntegerField";
 import { ModalPanelShell } from "../components/ui/ModalPanelShell";
 import {
-  COLOR_DOT_CLASS,
-  getRepresentativeCard,
+  getRepresentativeDeckVisual,
   getDeckCardCount,
+  getDeckColorIdentityPips,
 } from "../components/menu/deckHelpers";
+import { ManaSymbol } from "../components/mana/ManaSymbol";
 import { menuButtonClass } from "../components/menu/buttonStyles";
-import { ACTIVE_DECK_KEY, loadSavedDeckBracket, touchDeckPlayed } from "../constants/storage";
+import {
+  ACTIVE_DECK_KEY,
+  isRandomDeckSelection,
+  loadSavedDeckBracket,
+  touchDeckPlayed,
+} from "../constants/storage";
 import { useCardImage } from "../hooks/useCardImage";
 import { BRACKET_LABEL } from "../types/bracket";
 import { effectiveAiDifficulty, isDeckCedhLegal } from "../services/cedhLock";
+import { canAttemptNativeEngine } from "../services/nativeEngine";
 import { FORMAT_DEFAULTS } from "../stores/multiplayerStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
 import { useCardDataStore } from "../stores/cardDataStore";
@@ -75,6 +84,7 @@ export function GameSetupPage() {
   // Format picker modal -- opened by the hero chip below the title. Mobile
   // gets a full-screen sheet via <ModalPanelShell>; desktop centers it.
   const [formatPickerOpen, setFormatPickerOpen] = useState(false);
+  const formatPickerTriggerRef = useRef<HTMLButtonElement>(null);
 
   // Format & config state
   const [selectedFormat, setSelectedFormat] = useState<GameFormat | null>(null);
@@ -170,7 +180,7 @@ export function GameSetupPage() {
     // active deck is not required to start.
     const suppliesDeck = formatSuppliesDeck(formatConfig.format);
     if (!activeDeckName && !suppliesDeck) return;
-    if (activeDeckName) touchDeckPlayed(activeDeckName);
+    if (activeDeckName && !isRandomDeckSelection(activeDeckName)) touchDeckPlayed(activeDeckName);
     const gameId = crypto.randomUUID();
     // Snapshot the per-seat AI config from preferences into the active-game
     // record. `AiOpponentConfig`'s `ensureAiSeatCount` effect normally syncs
@@ -191,14 +201,25 @@ export function GameSetupPage() {
       deckId: s.deckId === "Random" ? null : s.deckId,
     }));
     const headDifficulty = aiSeats[0]?.difficulty ?? "Medium";
-    saveActiveGame({ id: gameId, mode: "ai", difficulty: headDifficulty, aiSeats });
+    // The native server owns a fresh AI session and v1 deliberately has no
+    // resume contract. Preserve the existing pointer only for the WASM route.
+    if (!canAttemptNativeEngine(prefs.nativeEngineEnabled) || firstPlayer !== "random") {
+      saveActiveGame({ id: gameId, mode: "ai", difficulty: headDifficulty, aiSeats, formatConfig });
+    }
     useGameStore.setState({ gameId });
     const firstParam = firstPlayer !== "random" ? `&first=${firstPlayer}` : "";
     // CR 732.2a: carry the creation-time combo-detector opt-in into the game URL;
     // GamePage projects it onto the local MatchConfig. Omitted = Off (engine default).
-    const loopParam = loopDetection.type === "On" ? "&loop=on" : "";
+    const loopMode = loopDetectionModeToQuery(loopDetection);
+    const loopParam = loopMode ? `&loop=${loopMode}` : "";
+    // The URL carries the format NAME only, so the edited config (starting
+    // life) has to ride along out-of-band or GamePage re-derives it from
+    // `FORMAT_DEFAULTS` and silently discards the edit. Router state — the
+    // same channel `useBroker` uses — rather than a URL param, because the
+    // native-engine route above deliberately writes no resume pointer.
     navigate(
       `/game/${gameId}?mode=ai&difficulty=${headDifficulty}&format=${formatConfig.format}&players=${playerCount}&match=${matchType.toLowerCase()}${loopParam}${firstParam}`,
+      { state: { formatConfig } },
     );
   };
 
@@ -211,7 +232,7 @@ export function GameSetupPage() {
   const formatSupportsAi = selectedFormat !== "Planechase";
   const noDeckSelected = !suppliesDeck && !activeDeckName;
   const deckBlockedForSelectedFormat =
-    !suppliesDeck && selectedCompat?.selected_format_compatible === false;
+    !suppliesDeck && !isRandomDeckSelection(activeDeckName) && selectedCompat?.selected_format_compatible === false;
   const noLegalAiDecks = !suppliesDeck && legalAiDeckCount === 0;
   // Block start only while the card DB is actively loading — not on `error`/`idle`,
   // since initializeGame awaits ensureCardDb itself and an errored warm must not
@@ -223,21 +244,26 @@ export function GameSetupPage() {
   // cEDH warning: shown when the human deck is not bracket 5 but the table is
   // in cEDH mode (all AI play cEDH).
   const cedhMode = usePreferencesStore((s) => s.cedhMode);
-  const humanDeckBracket = activeDeckName ? loadSavedDeckBracket(activeDeckName) : null;
+  const randomDeckSelected = isRandomDeckSelection(activeDeckName);
+  const humanDeckBracket = activeDeckName && !randomDeckSelected ? loadSavedDeckBracket(activeDeckName) : null;
   const showCedhWarning =
     activeDeckName !== null &&
+    !randomDeckSelected &&
     cedhMode &&
     !isDeckCedhLegal(humanDeckBracket);
-  const representativeCard = useMemo(
-    () => (activeDeckName ? getRepresentativeCard(activeDeckName) : null),
+  const representativeVisual = useMemo(
+    () => (activeDeckName && !isRandomDeckSelection(activeDeckName) ? getRepresentativeDeckVisual(activeDeckName) : null),
     [activeDeckName],
   );
   const deckCardCount = useMemo(
-    () => (activeDeckName ? getDeckCardCount(activeDeckName) : 0),
+    () => (activeDeckName && !isRandomDeckSelection(activeDeckName) ? getDeckCardCount(activeDeckName) : 0),
     [activeDeckName],
   );
-  const { src: deckArtSrc } = useCardImage(representativeCard ?? "", { size: "art_crop" });
-  const colors = selectedCompat?.color_identity ?? [];
+  const { src: deckArtSrc, advanceFailedSource: advanceFailedDeckArtSource } = useCardImage(
+    representativeVisual?.name ?? "",
+    { size: "art_crop", sourcePrinting: representativeVisual?.sourcePrinting },
+  );
+  const colorPips = getDeckColorIdentityPips(selectedCompat?.color_identity ?? null);
 
   return (
     <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
@@ -258,6 +284,7 @@ export function GameSetupPage() {
           return (
             <div className="flex justify-center">
               <button
+                ref={formatPickerTriggerRef}
                 type="button"
                 onClick={() => setFormatPickerOpen(true)}
                 aria-haspopup="dialog"
@@ -267,7 +294,7 @@ export function GameSetupPage() {
                     ? t("gameSetup.formatChip.ariaLabel", { label: meta.label, group: meta.group })
                     : t("gameSetup.formatChip.ariaLabelEmpty")
                 }
-                className="group flex min-h-[48px] items-center gap-3 rounded-[16px] bg-black/18 px-4 py-2.5 ring-1 ring-white/10 transition-colors hover:ring-white/20"
+                className="group flex min-h-[48px] items-center gap-3 rounded-[8px] border border-white/10 bg-slate-950/72 px-4 py-2.5 transition-colors hover:border-white/20 hover:bg-slate-900/88"
               >
                 <span className="text-[0.62rem] font-medium uppercase tracking-[0.22em] text-slate-500">
                   {t("gameSetup.formatChip.kicker")}
@@ -315,6 +342,7 @@ export function GameSetupPage() {
             onSelectDeck={handleSelectDeck}
             onEditDeck={handleEditDeck}
             activeDeckName={activeDeckName}
+            randomSelectionMode="defer"
             bare
             onActiveDeckCompatChange={setSelectedCompat}
           />
@@ -322,12 +350,58 @@ export function GameSetupPage() {
           {/* Sidebar */}
           <div className="order-first md:sticky md:top-8 md:order-last md:self-start">
             <MenuPanel className="flex flex-col gap-4 px-4 py-4">
+              {/* Primary CTA — single dominant action on this page */}
+              <button
+                onClick={handleStartAI}
+                disabled={cannotStartAi}
+                className={menuButtonClass({
+                  tone: "emerald",
+                  size: "lg",
+                  disabled: cannotStartAi,
+                  // No `whitespace-nowrap`: the "Start Match (N opponents)" label
+                  // grows with player count and would overflow the fixed 280px
+                  // sidebar track, forcing page-wide horizontal scroll. Allow it
+                  // to wrap within the column instead.
+                  className: "w-full px-6 text-center",
+                })}
+              >
+                {playerCount > 2
+                  ? t("gameSetup.startMatchWithOpponents", { count: playerCount - 1 })
+                  : t("gameSetup.startMatch")}
+              </button>
+
+              {/* Separator */}
+              <div className="border-t border-white/8" />
+
               {/* Deck preview */}
-              {activeDeckName ? (
+              {randomDeckSelected ? (
+                <div>
+                  <div className="flex aspect-[5/3] items-center justify-center overflow-hidden rounded-xl border border-indigo-300/25 bg-indigo-500/10">
+                    <div className="flex h-16 w-16 items-center justify-center rounded-full bg-black/30 text-indigo-100 ring-1 ring-indigo-200/25">
+                      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-8 w-8">
+                        <path d="M5.75 3.5a3.25 3.25 0 0 0-3.25 3.25.75.75 0 0 0 1.5 0A1.75 1.75 0 0 1 5.75 5h6.69l-1.22 1.22a.75.75 0 1 0 1.06 1.06l2.5-2.5a.75.75 0 0 0 0-1.06l-2.5-2.5a.75.75 0 1 0-1.06 1.06L12.44 3.5H5.75Zm8.25 9.75A1.75 1.75 0 0 1 12.25 15H5.56l1.22-1.22a.75.75 0 1 0-1.06-1.06l-2.5 2.5a.75.75 0 0 0 0 1.06l2.5 2.5a.75.75 0 0 0 1.06-1.06L5.56 16.5h6.69a3.25 3.25 0 0 0 3.25-3.25.75.75 0 0 0-1.5 0Z" />
+                      </svg>
+                    </div>
+                  </div>
+                  <div className="mt-3">
+                    <h3 className="text-base font-semibold text-white">
+                      {t("gameSetup.deckPreview.randomTitle")}
+                    </h3>
+                    <p className="mt-1 text-xs leading-5 text-slate-400">
+                      {t("gameSetup.deckPreview.randomDescription")}
+                    </p>
+                  </div>
+                </div>
+              ) : activeDeckName ? (
                 <div>
                   <div className="aspect-[5/3] overflow-hidden rounded-xl bg-gray-800">
                     {deckArtSrc ? (
-                      <img src={deckArtSrc} alt="" className="h-full w-full object-cover" />
+                      <img
+                        src={deckArtSrc}
+                        alt=""
+                        className="h-full w-full object-cover"
+                        onError={() => advanceFailedDeckArtSource?.(deckArtSrc)}
+                      />
                     ) : (
                       <div className="h-full w-full animate-pulse bg-gray-800" />
                     )}
@@ -350,17 +424,13 @@ export function GameSetupPage() {
                     </button>
                   </div>
                   <div className="mt-1 flex items-center gap-2">
-                    <div className="flex items-center gap-1 rounded-full bg-black/35 px-1.5 py-1 ring-1 ring-white/10">
-                      {colors.map((c) => (
-                        <span
-                          key={c}
-                          className={`inline-block h-2.5 w-2.5 rounded-full ${COLOR_DOT_CLASS[c] ?? "bg-gray-400"}`}
-                        />
-                      ))}
-                      {colors.length === 0 && (
-                        <span className="inline-block h-2.5 w-2.5 rounded-full bg-gray-500" />
-                      )}
-                    </div>
+                    {colorPips && (
+                      <div className="flex items-center gap-1 rounded-full bg-black/35 px-1.5 py-1 ring-1 ring-white/10">
+                        {colorPips.map((color) => (
+                          <ManaSymbol key={color} shard={color} size="xs" />
+                        ))}
+                      </div>
+                    )}
                     <span className="text-xs text-gray-300">{t("gameSetup.deckPreview.cardCount", { count: deckCardCount })}</span>
                   </div>
                   {selectedCompat && (
@@ -420,11 +490,11 @@ export function GameSetupPage() {
                 <div className="flex flex-col gap-3">
                   <label className="flex items-center justify-between">
                     <span className="text-xs text-slate-400">{t("gameSetup.config.startingLife")}</span>
-                    <input
-                      type="number"
+                    <IntegerField
                       value={formatConfig.starting_life}
-                      onChange={(e) =>
-                        setFormatConfig({ ...formatConfig, starting_life: Number(e.target.value) })
+                      min={1}
+                      onCommit={(starting_life) =>
+                        setFormatConfig({ ...formatConfig, starting_life })
                       }
                       className="w-16 rounded-lg border border-gray-700 bg-gray-800/60 px-2 py-1 text-right text-sm text-white"
                     />
@@ -455,11 +525,11 @@ export function GameSetupPage() {
                     </label>
                   )}
 
-                  <div className="flex overflow-hidden rounded-lg border border-gray-700">
+                  <div className="grid grid-cols-2 gap-1 rounded-[10px] border border-gray-700 bg-gray-950/70 p-1">
                     <button
                       type="button"
                       onClick={() => { setMatchType("Bo1"); setLastMatchType("Bo1"); }}
-                      className={`flex-1 px-3 py-1.5 text-xs font-medium transition-colors ${
+                      className={`rounded-[7px] px-3 py-1.5 text-xs font-medium transition-colors ${
                         matchType === "Bo1"
                           ? "bg-indigo-600 text-white"
                           : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
@@ -471,7 +541,7 @@ export function GameSetupPage() {
                       type="button"
                       onClick={() => { setMatchType("Bo3"); setLastMatchType("Bo3"); }}
                       disabled={playerCount !== 2}
-                      className={`flex-1 px-3 py-1.5 text-xs font-medium transition-colors ${
+                      className={`rounded-[7px] px-3 py-1.5 text-xs font-medium transition-colors ${
                         matchType === "Bo3"
                           ? "bg-indigo-600 text-white"
                           : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
@@ -487,11 +557,11 @@ export function GameSetupPage() {
                     <span className="text-xs text-slate-400" title={t("common:comboDetector.title")}>
                       {t("common:comboDetector.label")}
                     </span>
-                    <div className="flex overflow-hidden rounded-lg border border-gray-700">
+                    <div className="grid grid-cols-2 gap-1 rounded-[10px] border border-gray-700 bg-gray-950/70 p-1">
                       <button
                         type="button"
                         onClick={() => setLoopDetection({ type: "Off" })}
-                        className={`flex-1 px-3 py-1.5 text-xs font-medium transition-colors ${
+                        className={`rounded-[7px] px-3 py-1.5 text-xs font-medium transition-colors ${
                           loopDetection.type === "Off"
                             ? "bg-indigo-600 text-white"
                             : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
@@ -501,27 +571,27 @@ export function GameSetupPage() {
                       </button>
                       <button
                         type="button"
-                        onClick={() => setLoopDetection({ type: "On" })}
-                        className={`flex-1 px-3 py-1.5 text-xs font-medium transition-colors ${
-                          loopDetection.type === "On"
+                        onClick={() => setLoopDetection({ type: "Interactive" })}
+                        className={`rounded-[7px] px-3 py-1.5 text-xs font-medium transition-colors ${
+                          loopDetection.type === "Interactive"
                             ? "bg-indigo-600 text-white"
                             : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
                         }`}
                       >
-                        {t("common:comboDetector.on")}
+                        {t("common:comboDetector.interactive")}
                       </button>
                     </div>
                   </label>
 
                   <label className="flex flex-col gap-1">
                     <span className="text-xs text-slate-400">{t("gameSetup.config.whoGoesFirst")}</span>
-                    <div className="flex overflow-hidden rounded-lg border border-gray-700">
+                    <div className="grid grid-cols-3 gap-1 rounded-[10px] border border-gray-700 bg-gray-950/70 p-1">
                       {(["random", "play", "draw"] as const).map((opt) => (
                         <button
                           key={opt}
                           type="button"
                           onClick={() => setFirstPlayer(opt)}
-                          className={`flex-1 px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
+                          className={`rounded-[7px] px-3 py-1.5 text-xs font-medium capitalize transition-colors ${
                             firstPlayer === opt
                               ? "bg-indigo-600 text-white"
                               : "bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-gray-200"
@@ -574,28 +644,6 @@ export function GameSetupPage() {
                 </div>
               )}
 
-              {/* Separator */}
-              <div className="border-t border-white/8" />
-
-              {/* Primary CTA — single dominant action on this page */}
-              <button
-                onClick={handleStartAI}
-                disabled={cannotStartAi}
-                className={menuButtonClass({
-                  tone: "emerald",
-                  size: "lg",
-                  disabled: cannotStartAi,
-                  // No `whitespace-nowrap`: the "Start Match (N opponents)" label
-                  // grows with player count and would overflow the fixed 280px
-                  // sidebar track, forcing page-wide horizontal scroll. Allow it
-                  // to wrap within the column instead.
-                  className: "w-full px-6 text-center",
-                })}
-              >
-                {playerCount > 2
-                  ? t("gameSetup.startMatchWithOpponents", { count: playerCount - 1 })
-                  : t("gameSetup.startMatch")}
-              </button>
             </MenuPanel>
           </div>
         </div>
@@ -607,6 +655,7 @@ export function GameSetupPage() {
         title={t("gameSetup.formatPicker.title")}
         subtitle={t("gameSetup.formatPicker.subtitle")}
         onClose={() => setFormatPickerOpen(false)}
+        returnFocusRef={formatPickerTriggerRef}
         maxWidthClassName="max-w-3xl"
         bodyClassName="overflow-y-auto px-4 pt-4 lg:px-6 lg:pt-6"
       >

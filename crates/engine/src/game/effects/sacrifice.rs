@@ -1,11 +1,10 @@
 use crate::game::quantity::resolve_quantity_with_targets;
-use crate::game::sacrifice::{self, SacrificeOutcome};
 use crate::types::ability::{
-    ControllerRef, Effect, EffectError, EffectKind, QuantityExpr, ResolvedAbility, TargetFilter,
-    TargetRef,
+    ControllerRef, Effect, EffectError, EffectKind, EffectResolutionResult, QuantityExpr,
+    ResolvedAbility, TargetFilter, TargetRef, ThisWayCause,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::game_state::{GameState, PendingPlayerScopeSacrificeCompletion, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
@@ -43,7 +42,8 @@ fn resolve_sacrifice_scope(
             .map(|p| p.id)
             .filter(|&id| id != ability.controller)
             .collect(),
-        Some(ControllerRef::TargetPlayer) => ability
+        // CR 109.4: TargetOpponent reads identically to TargetPlayer.
+        Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => ability
             .targets
             .iter()
             .find_map(|t| match t {
@@ -108,6 +108,10 @@ fn resolve_sacrifice_scope(
         )
         .map(|pid| vec![pid])
         .unwrap_or_default(),
+        // CR 102.1: the active player, read live.
+        Some(ControllerRef::ActivePlayer) => vec![state.active_player],
+        // CR 109.4 + CR 611.2: a snapshotted id names exactly one sacrificer.
+        Some(ControllerRef::SpecificPlayer { id }) => vec![id],
     }
 }
 
@@ -129,7 +133,13 @@ pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EffectError> {
+) -> Result<Option<EffectResolutionResult>, EffectError> {
+    let completed_result = |count| {
+        Some(EffectResolutionResult {
+            cause: ThisWayCause::Sacrificed,
+            count,
+        })
+    };
     // CR 609.3: Resolve the dynamic sacrifice count through
     // `resolve_quantity_with_targets` before attempting the sacrifice so
     // mandatory effects can do as much as possible against the rebound
@@ -140,7 +150,7 @@ pub fn resolve(
     // `QuantityExpr` (Fixed/Ref/DivideRounded/...) means a mandatory count;
     // wrapped in `UpTo` means the player may select 0..=count.
     let default_count = QuantityExpr::Fixed { value: 1 };
-    let (filter, count_expr, up_to, min_count) = match &ability.effect {
+    let (raw_filter, count_expr, up_to, min_count) = match &ability.effect {
         Effect::Sacrifice {
             target,
             count,
@@ -151,18 +161,34 @@ pub fn resolve(
         }
         _ => (&TargetFilter::Any, &default_count, false, 0),
     };
+    // CR 608.2c + CR 510.2: Bind the parser's `TrackedSetId(0)` "most recent set"
+    // sentinel to a concrete filter before deriving the eligible pool. This is
+    // the same filter-level authority every other tracked-set consumer
+    // (`change_zone`, `shuffle`, `token_copy`, …) routes through, and it is the
+    // ONLY one that carries the combat-damage rung: for a "you may sacrifice one
+    // of them" trigger seeded from a `CombatDamageDealtToPlayer` event (e.g.
+    // Descendants' Fury), the eligible creatures live in the event's
+    // `source_amounts`, reachable only via `current_combat_damage_source_filter`.
+    // `matches_target_filter`'s id-level ladder (`resolve_tracked_set_id`) never
+    // reaches that rung, so matching the raw sentinel directly would leave the
+    // pool empty and silently sacrifice nothing. Non-sentinel filters (SelfRef,
+    // Any, controller-scoped) pass through unchanged.
+    let resolved_filter =
+        crate::game::targeting::resolve_tracked_set_sentinel(state, raw_filter.clone());
+    let filter = &resolved_filter;
     // CR 400.7: A self-referential sacrifice ("sacrifice this creature") does
     // nothing if the source has left and re-entered the battlefield (blink/
     // flicker) since this ability fired — the re-entered permanent is a new
     // object. Sacrifice is non-targeted and resolves `SelfRef` through a
     // resolution-time pool filter rather than the `resolved_targets` chokepoint,
     // so the self-reference epoch guard must be applied here explicitly.
-    if matches!(filter, TargetFilter::SelfRef) && !ability.source_is_current(state) {
+    if matches!(filter, TargetFilter::SelfRef) && !ability.self_ref_is_current(state) {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),
             source_id: ability.source_id,
+            subject: None,
         });
-        return Ok(());
+        return Ok(completed_result(0));
     }
     let scoped_ability;
     let ability = if matches!(
@@ -184,14 +210,60 @@ pub fn resolve(
     };
     let count = resolve_quantity_with_targets(state, count_expr, ability).max(0) as usize;
 
-    let targeted_objects = if matches!(
+    // CR 400.7 + CR 603.7c: a delayed sacrifice whose pinned referent became a
+    // new object affects nothing. Return before the empty-pool fallback below,
+    // which resolves a player scope and would make the controller sacrifice a
+    // DIFFERENT permanent (`resolve_sacrifice_scope`, CR 701.21a: "To sacrifice
+    // a permanent, its controller moves it from the battlefield directly to its
+    // owner's graveyard"). The surrounding sacrifice annotations use the
+    // verified CR 701.21a rule; CR 701.17 is mill.
+    //
+    // Emits EffectResolved first, matching the shipped CR 400.7 SelfRef guard
+    // above, which this guard is the direct extension of.
+    if ability.pinned_object_targets_all_stale(state) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(completed_result(0));
+    }
+
+    let live_targets = ability.live_object_targets(state);
+    let mut targeted_objects = if matches!(
         sacrifice_controller_scope(filter),
         Some(ControllerRef::ParentTargetController)
     ) {
         Vec::new()
     } else {
-        crate::game::effects::effect_object_targets(filter, &ability.targets)
+        // CR 400.7 + CR 603.7c: `effect_object_targets` indexes ParentTargetSlot
+        // by DECLARED position, so a pin-filtered slice would renumber every
+        // later slot. Pass the raw list for that filter shape.
+        let pool: &[TargetRef] = if matches!(filter, TargetFilter::ParentTargetSlot { .. }) {
+            &ability.targets
+        } else {
+            &live_targets
+        };
+        crate::game::effects::effect_object_targets(filter, pool)
     };
+
+    // CR 400.7 + CR 603.7c: preserve declared slot numbering while rejecting
+    // the individual stale referent after indexing. Falling through to the
+    // untargeted sacrifice path would make a controller sacrifice a different
+    // permanent, so this exact stale-slot shape resolves as a no-op instead.
+    let stale_parent_target_slot = matches!(filter, TargetFilter::ParentTargetSlot { .. })
+        && targeted_objects
+            .iter()
+            .any(|id| !ability.target_pin_is_current(*id, state));
+    targeted_objects.retain(|id| ability.target_pin_is_current(*id, state));
+    if stale_parent_target_slot {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(completed_result(0));
+    }
 
     if targeted_objects.is_empty() {
         // CR 701.21a: Derive the player(s) whose permanents are in scope from
@@ -226,9 +298,8 @@ pub fn resolve(
                 // object an earlier co-entering devourer already sacrificed is excluded by
                 // the live basis, and the devourers themselves by the snapshot.)
                 state
-                    .devour_eligible_snapshot
-                    .as_ref()
-                    .is_none_or(|s| s.contains(id))
+                    .active_devour_eligible_snapshot()
+                    .is_none_or(|snapshot| snapshot.contains(id))
                     && state.objects.get(id).is_some_and(|obj| {
                         obj.controller == chooser
                             && !obj.is_emblem
@@ -250,8 +321,9 @@ pub fn resolve(
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
+                subject: None,
             });
-            return Ok(());
+            return Ok(completed_result(0));
         }
 
         if eligible.is_empty() {
@@ -261,8 +333,9 @@ pub fn resolve(
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
+                subject: None,
             });
-            return Ok(());
+            return Ok(completed_result(0));
         }
 
         // CR 701.21a + CR 609.3: When the resolved count is at least the
@@ -270,33 +343,30 @@ pub fn resolve(
         // eligible permanent — the effect does as much as possible. Fast-path
         // this rather than round-tripping through EffectZoneChoice.
         if !up_to && eligible.len() <= count {
-            let mut sacrificed: i32 = 0;
-            for &obj_id in &eligible {
-                match sacrifice::sacrifice_permanent(state, obj_id, chooser, events) {
-                    Ok(SacrificeOutcome::Complete) => sacrificed += 1,
-                    Ok(SacrificeOutcome::NeedsReplacementChoice(player)) => {
-                        state.waiting_for =
-                            crate::game::replacement::replacement_choice_waiting_for(player, state);
-                        return Ok(());
-                    }
-                    Err(_) => {}
-                }
-            }
-            // CR 701.21a + CR 603.10a + CR 608.2f: every eligible permanent was
-            // sacrificed as part of the same resolution event, so co-departing
-            // sacrifice/LTB observers (Blood Artist) observe each other.
-            // `departed_subset` drops any permanent that didn't actually leave
-            // (e.g. CantBeSacrificed members excluded upstream).
-            crate::game::zones::mark_simultaneous_departures(
+            let completion = PendingPlayerScopeSacrificeCompletion {
+                effect_kind: Some(EffectKind::from(&ability.effect)),
+                // CR 608.2c: A replacement pause may stash a Demonstrative /
+                // CostPaidObject rider before this auto-path completes; keep the
+                // same continuation stamp the EffectZoneChoice path uses.
+                publish_fresh_tracked_set: state.active_ability_continuation().is_some(),
+                propagate_parent_context: state.active_ability_continuation().is_some(),
+                ..Default::default()
+            };
+            let outcome = super::perform_collected_player_scope_sacrifices_with_completion(
+                state,
+                ability.source_id,
+                ability.controller,
+                vec![(chooser, eligible)],
+                completion,
                 events,
-                &crate::game::zones::departed_subset(state, &eligible),
-            );
-            state.last_effect_count = Some(sacrificed);
-            events.push(GameEvent::EffectResolved {
-                kind: EffectKind::from(&ability.effect),
-                source_id: ability.source_id,
+            )?;
+            return Ok(match outcome {
+                super::PendingPlayerScopeSacrificeOutcome::Completed {
+                    sacrificed_count, ..
+                } => completed_result(sacrificed_count),
+                super::PendingPlayerScopeSacrificeOutcome::WaitingForNextChoice
+                | super::PendingPlayerScopeSacrificeOutcome::PausedForReplacement => None,
             });
-            return Ok(());
         }
 
         // CR 701.21a: "Sacrifice N permanents" — the affected player picks
@@ -325,20 +395,34 @@ pub fn resolve(
             conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
+            mass_library_order: None,
             is_cost_payment: false,
             enters_modified_if: None,
+            duration: None,
         };
 
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
         // (matching the DiscardChoice pattern — single authority for the event).
-        return Ok(());
+        return Ok(None);
     }
 
+    let mut selections = Vec::new();
     for obj_id in targeted_objects {
-        let obj = state
-            .objects
-            .get(&obj_id)
-            .ok_or(EffectError::ObjectNotFound(obj_id))?;
+        // CR 609.3 / CR 608.2b + CR 111.7: a member of this set that no longer
+        // exists is a normal outcome, not an error. Which rule says so depends
+        // on the caller, and this resolver serves both: for a snapshotted,
+        // non-targeted set the effect "does only as much as possible"
+        // (CR 609.3), while for a genuinely targeted sacrifice the vanished
+        // object is simply an illegal target (CR 608.2b). Either way a token
+        // that left the battlefield has ceased to exist (CR 111.7), so a
+        // delayed "sacrifice them" whose set lost a member must still sacrifice
+        // the survivors. Erroring here aborted the WHOLE effect on the first
+        // missing id, which is how a Mobilize pair that traded one Warrior in
+        // combat left the other on the battlefield forever (#8147). Skipping
+        // matches the emblem / wrong-zone / wrong-controller guards below.
+        let Some(obj) = state.objects.get(&obj_id) else {
+            continue;
+        };
 
         // CR 114.5: Emblems cannot be sacrificed
         if obj.is_emblem {
@@ -354,7 +438,20 @@ pub fn resolve(
         // they control. The primary fix is that Sacrifice no longer creates
         // target slots (see extract_target_filter_from_effect), but if this
         // path is ever reached, enforce controller ownership.
-        if obj.controller != ability.controller {
+        //
+        // CR 701.21a: "To sacrifice a permanent, its controller moves it..." — for an
+        // explicit anaphoric target (ParentTarget/ParentTargetSlot, e.g. Animate
+        // Dead's "that creature's controller sacrifices it"), the acting player is
+        // the object's OWN current controller, unconditionally, even if control
+        // changed since the ability (e.g. a delayed leaves-battlefield trigger) was
+        // created. The equality check below remains a valid defense-in-depth guard
+        // for every OTHER filter shape reaching this path.
+        if obj.controller != ability.controller
+            && !matches!(
+                filter,
+                TargetFilter::ParentTarget | TargetFilter::ParentTargetSlot { .. }
+            )
+        {
             continue;
         }
 
@@ -366,27 +463,29 @@ pub fn resolve(
             continue;
         }
 
-        match sacrifice::sacrifice_permanent(state, obj_id, player_id, events) {
-            Ok(SacrificeOutcome::Complete) => {}
-            Ok(SacrificeOutcome::NeedsReplacementChoice(player)) => {
-                state.waiting_for =
-                    crate::game::replacement::replacement_choice_waiting_for(player, state);
-                return Ok(());
-            }
-            Err(_) => {
-                // Object may have left the battlefield between check and sacrifice;
-                // skip silently (same as the zone check above).
-                continue;
-            }
-        }
+        selections.push((player_id, vec![obj_id]));
     }
 
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::from(&ability.effect),
-        source_id: ability.source_id,
-    });
+    let completion = PendingPlayerScopeSacrificeCompletion {
+        effect_kind: Some(EffectKind::from(&ability.effect)),
+        ..Default::default()
+    };
+    let outcome = super::perform_collected_player_scope_sacrifices_with_completion(
+        state,
+        ability.source_id,
+        ability.controller,
+        selections,
+        completion,
+        events,
+    )?;
 
-    Ok(())
+    Ok(match outcome {
+        super::PendingPlayerScopeSacrificeOutcome::Completed {
+            sacrificed_count, ..
+        } => completed_result(sacrificed_count),
+        super::PendingPlayerScopeSacrificeOutcome::WaitingForNextChoice
+        | super::PendingPlayerScopeSacrificeOutcome::PausedForReplacement => None,
+    })
 }
 
 #[cfg(test)]
@@ -559,6 +658,71 @@ mod tests {
             }
             other => panic!("expected EffectZoneChoice with eligible set, got {other:?}"),
         }
+    }
+
+    /// Cluster J1 (building-block companion to the Disciple of Bolas
+    /// cast-pipeline guard): "sacrifice **another** creature" as an EFFECT must
+    /// exclude the ability's source from the eligible pool. With exactly one
+    /// OTHER creature, the mandatory sacrifice auto-resolves onto it and the
+    /// source survives.
+    ///
+    /// CR 701.21a: sacrifice moves the chosen permanent to its owner's
+    /// graveyard. `FilterProp::Another` is evaluated via
+    /// `FilterContext::from_ability` (source excluded). The paired negative
+    /// (source survives) is made non-vacuous by asserting the OTHER creature was
+    /// actually moved to the graveyard.
+    #[test]
+    fn sacrifice_another_creature_effect_excludes_source_from_pool() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Disciple".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let other = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Hill Giant".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&other).unwrap().card_types.core_types = vec![CoreType::Creature];
+
+        let ability = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Another]),
+                ),
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.battlefield.contains(&source),
+            "FilterProp::Another must exclude the source — it survives"
+        );
+        assert!(
+            state.players[0].graveyard.contains(&other),
+            "the OTHER creature is the sole eligible target and is sacrificed"
+        );
+        assert!(
+            !state.battlefield.contains(&other),
+            "non-vacuous: the other creature actually left the battlefield"
+        );
     }
 
     #[test]
@@ -1497,11 +1661,16 @@ mod tests {
         let superlative = FilterProp::Cmc {
             comparator: Comparator::EQ,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::ManaValue,
-                    filter: eligible_set,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::ManaValue,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: eligible_set,
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
         };
         let soul_shatter_target = TargetFilter::Or {
@@ -1621,11 +1790,16 @@ mod tests {
             scope: PtValueScope::Current,
             comparator: Comparator::EQ,
             value: QuantityExpr::Ref {
-                qty: QuantityRef::Aggregate {
-                    function: AggregateFunction::Max,
-                    property: ObjectProperty::Power,
-                    filter: eligible_set,
-                },
+                qty: QuantityRef::PropertyAggregate(
+                    crate::types::ability::PropertyAggregate::new(
+                        AggregateFunction::Max,
+                        ObjectProperty::Power,
+                        crate::types::ability::CardTypeSetSource::Objects {
+                            filter: eligible_set,
+                        },
+                    )
+                    .expect("statically valid property aggregate"),
+                ),
             },
         };
         let target = TargetFilter::Typed(
